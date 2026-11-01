@@ -335,6 +335,35 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	/* glassine: the apps' environment. Every GLASSINE_APP_X=v sway was started with
+	 * becomes X=v for what sway starts from now on (apps, Xwayland):
+	 * GLASSINE_APP_FD_MESA_DEBUG (glassine-session-sway's /etc/glassine/gpu-app-split),
+	 * GLASSINE_APP_FD_CHUNK_US / _COST (/etc/glassine/gpu-app-l3, chunked submits).
+	 * freedreno read sway's own values once, when server_init created the
+	 * renderer, so sway itself keeps them. Collected first: setenv may move
+	 * environ while it is walked */
+	{
+		extern char **environ;
+		static const char glassine_pre[] = "GLASSINE_APP_";
+		char *glassine_set[32];
+		int glassine_n = 0;
+		for (char **e = environ; *e && glassine_n < 32; e++) {
+			if (strncmp(*e, glassine_pre, sizeof(glassine_pre) - 1) == 0 &&
+					strchr(*e, '=') > *e + sizeof(glassine_pre) - 1) {
+				glassine_set[glassine_n++] = strdup(*e + sizeof(glassine_pre) - 1);
+			}
+		}
+		for (int i = 0; i < glassine_n; i++) {
+			char *eq = glassine_set[i] ? strchr(glassine_set[i], '=') : NULL;
+			if (eq) {
+				*eq = '\0';
+				setenv(glassine_set[i], eq + 1, true);
+				sway_log(SWAY_INFO, "glassine: apps get %s=%s", glassine_set[i], eq + 1);
+			}
+			free(glassine_set[i]);
+		}
+	}
+
 	if (server.linux_dmabuf_v1) {
 		wlr_scene_set_linux_dmabuf_v1(root->root_scene, server.linux_dmabuf_v1);
 	}
