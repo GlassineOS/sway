@@ -1,0 +1,7 @@
+# Upstream sway's own history: reviewed 2026-11-01, not our content.
+# sway-ipc.7.scd: example paths in the IPC docs. The .a files: archives upstream
+# committed by mistake and removed in 76920d27.
+allow-path sway/sway-ipc.7.scd
+allow-path common/libsway-common.a
+allow-path protocols/libsway-protocols.a
+allow-path wayland/libsway-wayland.a
