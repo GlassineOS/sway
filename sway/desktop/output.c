@@ -35,6 +35,7 @@
 #include "sway/tree/root.h"
 #include "sway/tree/view.h"
 #include "sway/tree/workspace.h"
+#include "../glassine-ink-area.h"
 
 #if WLR_HAS_DRM_BACKEND
 #include <wlr/backend/drm.h>
@@ -355,6 +356,9 @@ static int output_repaint_timer_handler(void *data) {
 
 	if (!wlr_output_commit_state(output->wlr_output, &pending)) {
 		sway_log(SWAY_ERROR, "Page-flip failed on output %s", output->wlr_output->name);
+	} else {
+		/* Glassine: the pen's ink areas for glassine-epdd-desktop (the windows' visible regions) */
+		glassine_ink_update(output);
 	}
 	wlr_output_state_finish(&pending);
 	return 0;

@@ -12,6 +12,8 @@ sway_sources = files(
 	'server.c',
 	'glassine-epd-backend.c',
 	'glassine-popup-hint.c',
+	'glassine-ink-area.c',
+	'epd-brush.c',
 	'sway_text_node.c',
 	'swaynag.c',
 	'xdg_activation_v1.c',
