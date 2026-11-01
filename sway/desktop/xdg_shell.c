@@ -17,6 +17,7 @@
 #include "sway/tree/view.h"
 #include "sway/tree/workspace.h"
 #include "sway/xdg_decoration.h"
+#include "../glassine-popup-hint.h"
 
 static struct sway_xdg_popup *popup_create(
 	struct wlr_xdg_popup *wlr_popup, struct sway_view *view,
@@ -126,6 +127,9 @@ static struct sway_xdg_popup *popup_create(struct wlr_xdg_popup *wlr_popup,
 	popup->reposition.notify = popup_handle_reposition;
 	wl_signal_add(&wlr_popup->events.destroy, &popup->destroy);
 	popup->destroy.notify = popup_handle_destroy;
+
+	/* Glassine: menus as popups for glassine-epdd-desktop (sway IPC doesn't report them) */
+	glassine_popup_track(wlr_popup, popup->xdg_surface_tree);
 
 	return popup;
 }
