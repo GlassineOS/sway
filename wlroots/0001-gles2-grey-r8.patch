@@ -1,0 +1,211 @@
+
+--- a/include/render/gles2.h
++++ b/include/render/gles2.h
+@@ -35,6 +35,7 @@
+ 	GLint tex_proj;
+ 	GLint tex;
+ 	GLint alpha;
++	GLint grey;
+ 	GLint pos_attrib;
+ };
+ 
+@@ -79,6 +80,7 @@
+ 			GLuint program;
+ 			GLint proj;
+ 			GLint color;
++			GLint grey;
+ 			GLint pos_attrib;
+ 		} quad;
+ 		struct wlr_gles2_tex_shader tex_rgba;
+@@ -138,6 +140,7 @@
+ 	float projection_matrix[9];
+ 	struct wlr_egl_context prev_ctx;
+ 	struct wlr_gles2_render_timer *timer;
++	float grey; /* Glassine: 1 = the target is R8, the shaders write luma */
+ };
+ 
+ bool is_gles2_pixel_format_supported(const struct wlr_gles2_renderer *renderer,
+
+--- a/include/wlr/render/wlr_renderer.h
++++ b/include/wlr/render/wlr_renderer.h
+@@ -68,6 +68,12 @@
+  * Buffers allocated with a format from this list may be passed to
+  * wlr_texture_from_buffer().
+  */
++/**
++ * Glassine: the formats the renderer can render into (otherwise internal: sway's
++ * glassine-epd backend checks R8 for its grey output).
++ */
++const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
++	struct wlr_renderer *renderer);
+ const struct wlr_drm_format_set *wlr_renderer_get_texture_formats(
+ 	struct wlr_renderer *r, uint32_t buffer_caps);
+ 
+
+--- a/render/gles2/pass.c
++++ b/render/gles2/pass.c
+@@ -4,6 +4,7 @@
+ #include <time.h>
+ #include <wlr/types/wlr_matrix.h>
+ #include <wlr/util/transform.h>
++#include <drm_fourcc.h>
+ #include "render/gles2.h"
+ #include "types/wlr_matrix.h"
+ 
+@@ -196,6 +197,7 @@
+ 
+ 	glUniform1i(shader->tex, 0);
+ 	glUniform1f(shader->alpha, alpha);
++	glUniform1f(shader->grey, pass->grey);
+ 	set_proj_matrix(shader->proj, pass->projection_matrix, &dst_box);
+ 	set_tex_matrix(shader->tex_proj, options->transform, &src_fbox);
+ 
+@@ -221,6 +223,7 @@
+ 
+ 	set_proj_matrix(renderer->shaders.quad.proj, pass->projection_matrix, &box);
+ 	glUniform4f(renderer->shaders.quad.color, color->r, color->g, color->b, color->a);
++	glUniform1f(renderer->shaders.quad.grey, pass->grey);
+ 
+ 	render(&box, options->clip, renderer->shaders.quad.pos_attrib);
+ 
+@@ -275,6 +278,9 @@
+ 	pass->buffer = buffer;
+ 	pass->timer = timer;
+ 	pass->prev_ctx = *prev_ctx;
++	struct wlr_dmabuf_attributes dmabuf;
++	pass->grey = wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf) &&
++		dmabuf.format == DRM_FORMAT_R8 ? 1.0f : 0.0f;
+ 
+ 	matrix_projection(pass->projection_matrix, wlr_buffer->width, wlr_buffer->height,
+ 		WL_OUTPUT_TRANSFORM_FLIPPED_180);
+
+--- a/render/gles2/renderer.c
++++ b/render/gles2/renderer.c
+@@ -640,6 +640,7 @@
+ 	}
+ 	renderer->shaders.quad.proj = glGetUniformLocation(prog, "proj");
+ 	renderer->shaders.quad.color = glGetUniformLocation(prog, "color");
++	renderer->shaders.quad.grey = glGetUniformLocation(prog, "grey");
+ 	renderer->shaders.quad.pos_attrib = glGetAttribLocation(prog, "pos");
+ 
+ 	renderer->shaders.tex_rgba.program = prog =
+@@ -651,6 +652,7 @@
+ 	renderer->shaders.tex_rgba.tex_proj = glGetUniformLocation(prog, "tex_proj");
+ 	renderer->shaders.tex_rgba.tex = glGetUniformLocation(prog, "tex");
+ 	renderer->shaders.tex_rgba.alpha = glGetUniformLocation(prog, "alpha");
++	renderer->shaders.tex_rgba.grey = glGetUniformLocation(prog, "grey");
+ 	renderer->shaders.tex_rgba.pos_attrib = glGetAttribLocation(prog, "pos");
+ 
+ 	renderer->shaders.tex_rgbx.program = prog =
+@@ -662,6 +664,7 @@
+ 	renderer->shaders.tex_rgbx.tex_proj = glGetUniformLocation(prog, "tex_proj");
+ 	renderer->shaders.tex_rgbx.tex = glGetUniformLocation(prog, "tex");
+ 	renderer->shaders.tex_rgbx.alpha = glGetUniformLocation(prog, "alpha");
++	renderer->shaders.tex_rgbx.grey = glGetUniformLocation(prog, "grey");
+ 	renderer->shaders.tex_rgbx.pos_attrib = glGetAttribLocation(prog, "pos");
+ 
+ 	if (renderer->exts.OES_egl_image_external) {
+@@ -674,6 +677,7 @@
+ 		renderer->shaders.tex_ext.tex_proj = glGetUniformLocation(prog, "tex_proj");
+ 		renderer->shaders.tex_ext.tex = glGetUniformLocation(prog, "tex");
+ 		renderer->shaders.tex_ext.alpha = glGetUniformLocation(prog, "alpha");
++		renderer->shaders.tex_ext.grey = glGetUniformLocation(prog, "grey");
+ 		renderer->shaders.tex_ext.pos_attrib = glGetAttribLocation(prog, "pos");
+ 	}
+ 
+
+--- a/render/gles2/shaders/quad.frag
++++ b/render/gles2/shaders/quad.frag
+@@ -8,6 +8,19 @@
+ varying vec2 v_texcoord;
+ uniform vec4 color;
+ 
++uniform float grey;
++
++/* Glassine (e-ink): an R8 render target gets the luma, as glassine-epdd-desktop computes it
++ * ((77 r + 150 g + 29 b) >> 8 of the 8-bit channels): exact for opaque
++ * pixels; luma is linear, so blending grey == the grey of the blend */
++vec4 glassine_out(vec4 c) {
++	if (grey < 0.5) {
++		return c;
++	}
++	float l = floor(dot(floor(c.rgb * 255.0 + 0.5), vec3(77.0, 150.0, 29.0)) / 256.0) / 255.0;
++	return vec4(l, l, l, c.a);
++}
++
+ void main() {
+-	gl_FragColor = color;
++	gl_FragColor = glassine_out(color);
+ }
+
+--- a/render/gles2/shaders/tex_external.frag
++++ b/render/gles2/shaders/tex_external.frag
+@@ -10,6 +10,19 @@
+ uniform samplerExternalOES texture0;
+ uniform float alpha;
+ 
++uniform float grey;
++
++/* Glassine (e-ink): an R8 render target gets the luma, as glassine-epdd-desktop computes it
++ * ((77 r + 150 g + 29 b) >> 8 of the 8-bit channels): exact for opaque
++ * pixels; luma is linear, so blending grey == the grey of the blend */
++vec4 glassine_out(vec4 c) {
++	if (grey < 0.5) {
++		return c;
++	}
++	float l = floor(dot(floor(c.rgb * 255.0 + 0.5), vec3(77.0, 150.0, 29.0)) / 256.0) / 255.0;
++	return vec4(l, l, l, c.a);
++}
++
+ void main() {
+-	gl_FragColor = texture2D(texture0, v_texcoord) * alpha;
++	gl_FragColor = glassine_out(texture2D(texture0, v_texcoord) * alpha);
+ }
+
+--- a/render/gles2/shaders/tex_rgba.frag
++++ b/render/gles2/shaders/tex_rgba.frag
+@@ -8,6 +8,19 @@
+ uniform sampler2D tex;
+ uniform float alpha;
+ 
++uniform float grey;
++
++/* Glassine (e-ink): an R8 render target gets the luma, as glassine-epdd-desktop computes it
++ * ((77 r + 150 g + 29 b) >> 8 of the 8-bit channels): exact for opaque
++ * pixels; luma is linear, so blending grey == the grey of the blend */
++vec4 glassine_out(vec4 c) {
++	if (grey < 0.5) {
++		return c;
++	}
++	float l = floor(dot(floor(c.rgb * 255.0 + 0.5), vec3(77.0, 150.0, 29.0)) / 256.0) / 255.0;
++	return vec4(l, l, l, c.a);
++}
++
+ void main() {
+-	gl_FragColor = texture2D(tex, v_texcoord) * alpha;
++	gl_FragColor = glassine_out(texture2D(tex, v_texcoord) * alpha);
+ }
+
+--- a/render/gles2/shaders/tex_rgbx.frag
++++ b/render/gles2/shaders/tex_rgbx.frag
+@@ -8,6 +8,19 @@
+ uniform sampler2D tex;
+ uniform float alpha;
+ 
++uniform float grey;
++
++/* Glassine (e-ink): an R8 render target gets the luma, as glassine-epdd-desktop computes it
++ * ((77 r + 150 g + 29 b) >> 8 of the 8-bit channels): exact for opaque
++ * pixels; luma is linear, so blending grey == the grey of the blend */
++vec4 glassine_out(vec4 c) {
++	if (grey < 0.5) {
++		return c;
++	}
++	float l = floor(dot(floor(c.rgb * 255.0 + 0.5), vec3(77.0, 150.0, 29.0)) / 256.0) / 255.0;
++	return vec4(l, l, l, c.a);
++}
++
+ void main() {
+-	gl_FragColor = vec4(texture2D(tex, v_texcoord).rgb, 1.0) * alpha;
++	gl_FragColor = glassine_out(vec4(texture2D(tex, v_texcoord).rgb, 1.0) * alpha);
+ }

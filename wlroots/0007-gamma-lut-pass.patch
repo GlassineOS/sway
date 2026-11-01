@@ -1,0 +1,213 @@
+diff -ruN wlr-base7/include/render/gles2.h wlr-ours/include/render/gles2.h
+--- a/include/render/gles2.h
++++ b/include/render/gles2.h
+@@ -36,6 +36,7 @@
+ 	GLint tex;
+ 	GLint alpha;
+ 	GLint grey;
++	GLint glassine_lut;
+ 	GLint pos_attrib;
+ };
+ 
+@@ -90,6 +91,14 @@
+ 
+ 	struct wl_list buffers; // wlr_gles2_buffer.link
+ 	struct wl_list textures; // wlr_gles2_texture.link
++
++	/* Glassine: the panel's gamma table (wlr_gles2_renderer_glassine_set_lut), a 256 x 1
++	 * LUMINANCE texture; while on, an R8 target's texture draws map the
++	 * source's red byte through it (shaders' glassine_out, grey 3) */
++	struct {
++		GLuint tex;
++		bool on;
++	} glassine_lut;
+ };
+ 
+ struct wlr_gles2_render_timer {
+diff -ruN wlr-base7/include/wlr/render/gles2.h wlr-ours/include/wlr/render/gles2.h
+--- a/include/wlr/render/gles2.h
++++ b/include/wlr/render/gles2.h
+@@ -35,6 +35,12 @@
+ bool wlr_gles2_renderer_check_ext(struct wlr_renderer *renderer, const char *ext);
+ GLuint wlr_gles2_renderer_get_buffer_fbo(struct wlr_renderer *renderer, struct wlr_buffer *buffer);
+ 
++/* Glassine (e-ink): the panel's gamma table, 256 bytes (glassine-epdd-desktop's). While a
++ * pass is on, a texture drawn into an R8 target is written as
++ * lut[the source's red byte]: the grey output's final pass (glassine-epd backend) */
++bool wlr_gles2_renderer_glassine_set_lut(struct wlr_renderer *renderer, const uint8_t lut[256]);
++void wlr_gles2_renderer_glassine_lut_pass(struct wlr_renderer *renderer, bool on);
++
+ struct wlr_gles2_texture_attribs {
+ 	GLenum target; /* either GL_TEXTURE_2D or GL_TEXTURE_EXTERNAL_OES */
+ 	GLuint tex;
+diff -ruN wlr-base7/render/gles2/pass.c wlr-ours/render/gles2/pass.c
+--- a/render/gles2/pass.c
++++ b/render/gles2/pass.c
+@@ -209,12 +209,24 @@
+ 
+ 	glUniform1i(shader->tex, 0);
+ 	glUniform1f(shader->alpha, alpha);
+-	glUniform1f(shader->grey, pass->grey);
++	bool glassine_lut = renderer->glassine_lut.on && renderer->glassine_lut.tex && pass->grey > 0.0f;
++	if (glassine_lut) {	/* Glassine: the grey output's final pass (wlr_gles2_renderer_glassine_lut_pass) */
++		glActiveTexture(GL_TEXTURE1);
++		glBindTexture(GL_TEXTURE_2D, renderer->glassine_lut.tex);
++		glActiveTexture(GL_TEXTURE0);
++		glUniform1i(shader->glassine_lut, 1);
++	}
++	glUniform1f(shader->grey, glassine_lut ? 3.0f : pass->grey);
+ 	set_proj_matrix(shader->proj, pass->projection_matrix, &dst_box);
+ 	set_tex_matrix(shader->tex_proj, options->transform, &src_fbox);
+ 
+ 	render(&dst_box, options->clip, shader->pos_attrib);
+ 
++	if (glassine_lut) {
++		glActiveTexture(GL_TEXTURE1);
++		glBindTexture(GL_TEXTURE_2D, 0);
++		glActiveTexture(GL_TEXTURE0);
++	}
+ 	glBindTexture(texture->target, 0);
+ 	pop_gles2_debug(renderer);
+ }
+diff -ruN wlr-base7/render/gles2/renderer.c wlr-ours/render/gles2/renderer.c
+--- a/render/gles2/renderer.c
++++ b/render/gles2/renderer.c
+@@ -200,6 +200,35 @@
+ 	return renderer->egl;
+ }
+ 
++bool wlr_gles2_renderer_glassine_set_lut(struct wlr_renderer *wlr_renderer, const uint8_t lut[256]) {
++	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
++	struct wlr_egl_context prev_ctx;
++	if (!wlr_egl_make_current(renderer->egl, &prev_ctx)) {
++		return false;
++	}
++	push_gles2_debug(renderer);
++	if (!renderer->glassine_lut.tex) {
++		glGenTextures(1, &renderer->glassine_lut.tex);
++	}
++	glBindTexture(GL_TEXTURE_2D, renderer->glassine_lut.tex);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 256, 1, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, lut);
++	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++	glBindTexture(GL_TEXTURE_2D, 0);
++	pop_gles2_debug(renderer);
++	bool ok = glGetError() == GL_NO_ERROR;
++	wlr_egl_restore_context(&prev_ctx);
++	return ok;
++}
++
++void wlr_gles2_renderer_glassine_lut_pass(struct wlr_renderer *wlr_renderer, bool on) {
++	gles2_get_renderer(wlr_renderer)->glassine_lut.on = on;
++}
++
+ static void gles2_destroy(struct wlr_renderer *wlr_renderer) {
+ 	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
+ 
+@@ -216,6 +245,9 @@
+ 	}
+ 
+ 	push_gles2_debug(renderer);
++	if (renderer->glassine_lut.tex) {
++		glDeleteTextures(1, &renderer->glassine_lut.tex);
++	}
+ 	glDeleteProgram(renderer->shaders.quad.program);
+ 	glDeleteProgram(renderer->shaders.tex_rgba.program);
+ 	glDeleteProgram(renderer->shaders.tex_rgbx.program);
+@@ -653,6 +685,7 @@
+ 	renderer->shaders.tex_rgba.tex = glGetUniformLocation(prog, "tex");
+ 	renderer->shaders.tex_rgba.alpha = glGetUniformLocation(prog, "alpha");
+ 	renderer->shaders.tex_rgba.grey = glGetUniformLocation(prog, "grey");
++	renderer->shaders.tex_rgba.glassine_lut = glGetUniformLocation(prog, "glassine_lut");
+ 	renderer->shaders.tex_rgba.pos_attrib = glGetAttribLocation(prog, "pos");
+ 
+ 	renderer->shaders.tex_rgbx.program = prog =
+@@ -665,6 +698,7 @@
+ 	renderer->shaders.tex_rgbx.tex = glGetUniformLocation(prog, "tex");
+ 	renderer->shaders.tex_rgbx.alpha = glGetUniformLocation(prog, "alpha");
+ 	renderer->shaders.tex_rgbx.grey = glGetUniformLocation(prog, "grey");
++	renderer->shaders.tex_rgbx.glassine_lut = glGetUniformLocation(prog, "glassine_lut");
+ 	renderer->shaders.tex_rgbx.pos_attrib = glGetAttribLocation(prog, "pos");
+ 
+ 	if (renderer->exts.OES_egl_image_external) {
+@@ -678,6 +712,7 @@
+ 		renderer->shaders.tex_ext.tex = glGetUniformLocation(prog, "tex");
+ 		renderer->shaders.tex_ext.alpha = glGetUniformLocation(prog, "alpha");
+ 		renderer->shaders.tex_ext.grey = glGetUniformLocation(prog, "grey");
++		renderer->shaders.tex_ext.glassine_lut = glGetUniformLocation(prog, "glassine_lut");
+ 		renderer->shaders.tex_ext.pos_attrib = glGetAttribLocation(prog, "pos");
+ 	}
+ 
+diff -ruN wlr-base7/render/gles2/shaders/tex_external.frag wlr-ours/render/gles2/shaders/tex_external.frag
+--- a/render/gles2/shaders/tex_external.frag
++++ b/render/gles2/shaders/tex_external.frag
+@@ -11,6 +11,7 @@
+ uniform float alpha;
+ 
+ uniform float grey;
++uniform sampler2D glassine_lut;
+ 
+ /* Glassine (e-ink): an R8 render target gets the grey value q, as glassine-epdd-desktop
+  * computes it (epd-grey.h). grey 1: luma, (77 r + 150 g + 29 b) >> 8 of the
+@@ -23,6 +24,11 @@
+ 	if (grey < 0.5) {
+ 		return c;
+ 	}
++	if (grey > 2.5) {	/* grey 3 (Note Air 1): an R8 source's byte through the gamma table */
++		float i = floor(c.r * 255.0 + 0.5);
++		float g = texture2D(glassine_lut, vec2((i + 0.5) / 256.0, 0.5)).r;
++		return vec4(g, g, g, 1.0);
++	}
+ 	float l;
+ 	if (grey < 1.5) {
+ 		l = floor(dot(floor(c.rgb * 255.0 + 0.5), vec3(77.0, 150.0, 29.0)) / 256.0) / 255.0;
+diff -ruN wlr-base7/render/gles2/shaders/tex_rgba.frag wlr-ours/render/gles2/shaders/tex_rgba.frag
+--- a/render/gles2/shaders/tex_rgba.frag
++++ b/render/gles2/shaders/tex_rgba.frag
+@@ -9,6 +9,7 @@
+ uniform float alpha;
+ 
+ uniform float grey;
++uniform sampler2D glassine_lut;
+ 
+ /* Glassine (e-ink): an R8 render target gets the grey value q, as glassine-epdd-desktop
+  * computes it (epd-grey.h). grey 1: luma, (77 r + 150 g + 29 b) >> 8 of the
+@@ -21,6 +22,11 @@
+ 	if (grey < 0.5) {
+ 		return c;
+ 	}
++	if (grey > 2.5) {	/* grey 3 (Note Air 1): an R8 source's byte through the gamma table */
++		float i = floor(c.r * 255.0 + 0.5);
++		float g = texture2D(glassine_lut, vec2((i + 0.5) / 256.0, 0.5)).r;
++		return vec4(g, g, g, 1.0);
++	}
+ 	float l;
+ 	if (grey < 1.5) {
+ 		l = floor(dot(floor(c.rgb * 255.0 + 0.5), vec3(77.0, 150.0, 29.0)) / 256.0) / 255.0;
+diff -ruN wlr-base7/render/gles2/shaders/tex_rgbx.frag wlr-ours/render/gles2/shaders/tex_rgbx.frag
+--- a/render/gles2/shaders/tex_rgbx.frag
++++ b/render/gles2/shaders/tex_rgbx.frag
+@@ -9,6 +9,7 @@
+ uniform float alpha;
+ 
+ uniform float grey;
++uniform sampler2D glassine_lut;
+ 
+ /* Glassine (e-ink): an R8 render target gets the grey value q, as glassine-epdd-desktop
+  * computes it (epd-grey.h). grey 1: luma, (77 r + 150 g + 29 b) >> 8 of the
+@@ -21,6 +22,11 @@
+ 	if (grey < 0.5) {
+ 		return c;
+ 	}
++	if (grey > 2.5) {	/* grey 3 (Note Air 1): an R8 source's byte through the gamma table */
++		float i = floor(c.r * 255.0 + 0.5);
++		float g = texture2D(glassine_lut, vec2((i + 0.5) / 256.0, 0.5)).r;
++		return vec4(g, g, g, 1.0);
++	}
+ 	float l;
+ 	if (grey < 1.5) {
+ 		l = floor(dot(floor(c.rgb * 255.0 + 0.5), vec3(77.0, 150.0, 29.0)) / 256.0) / 255.0;

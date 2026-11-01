@@ -1,0 +1,38 @@
+Subject: [PATCH] glassine: xwayland: wm_fd[0] belongs to the xwm once it is handed over (double close)
+
+The lazy-Xwayland hang came back (sway pid 7718): after an
+Xwayland exit and a successful lazy re-arm, new X clients never woke sway.
+a capture: of the three X0 listen fds (28 = abstract @/tmp/.X11-unix/X0,
+29 = the path socket, 158 = a dup of 29), sway's epoll watched only 158,
+the dup that wl_event_loop_add_fd made of x_fd[1]; the dup of x_fd[0] (the
+abstract socket, which libxcb tries first) was gone, so a client's connect
+sat in that backlog forever.
+
+Cause: the ready event hands wm_fd[0] to the xwm (xcb_connect_to_fd), and
+xcb_disconnect in xwm_destroy closes it, but server_finish_process closes
+wm_fd[0] too. When Xwayland exits, its Wayland client and the xwm's X
+connection both hang up; if the client destroy runs first,
+server_finish_process frees that number, the lazy re-arm's first
+wl_event_loop_add_fd (x_fd[0]) dups into it, and the xwm's HUP handler then
+closes it in xcb_disconnect. Order-dependent, hence most cycles worked.
+Fix: after the ready event, wm_fd[0] is no longer the server's.
+
+--- a/xwayland/server.c
++++ b/xwayland/server.c
+@@ -290,6 +290,16 @@
+ 		.wm_fd = server->wm_fd[0],
+ 	};
+ 	wl_signal_emit_mutable(&server->events.ready, &event);
++	/* glassine: the xwm owns wm_fd[0] now (xcb_connect_to_fd; xcb_disconnect closes
++	 * it). server_finish_process closed it again: a double close. When
++	 * Xwayland exits, the client destroy can run before the xwm's HUP: then
++	 * the lazy re-arm's first wl_event_loop_add_fd dup (the abstract @X0
++	 * socket) gets that just-freed number, and xwm_destroy's xcb_disconnect
++	 * closes it -> X clients connect to @X0 and hang forever, nobody watches
++	 * it (a capture epoll had only the X0 path socket's dup) */
++	if (!wl_list_empty(&server->events.ready.listener_list)) {
++		server->wm_fd[0] = -1;	/* (no listener: nobody took it, still ours) */
++	}
+ 
+ 	/* We removed the source, so don't need recheck */
+ 	return 0;

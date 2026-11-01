@@ -1,0 +1,178 @@
+--- a/types/wlr_compositor.c
++++ b/types/wlr_compositor.c
+@@ -1,4 +1,8 @@
+ #include <assert.h>
++#include <poll.h>
++#include <time.h>
++#include <unistd.h>
++#include <linux/dma-buf.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <wayland-server-core.h>
+@@ -10,6 +14,7 @@
+ #include <wlr/util/log.h>
+ #include <wlr/util/region.h>
+ #include <wlr/util/transform.h>
++#include "render/dmabuf.h"
+ #include "types/wlr_buffer.h"
+ #include "types/wlr_region.h"
+ #include "types/wlr_subcompositor.h"
+@@ -508,6 +513,16 @@
+ 	wl_resource_post_no_memory(surface->resource);
+ }
+ 
++/* GLASSINE_LATCH_LOG=1: trace the fence waits (at error level,
++ * prefix "glassine-latch", so a default sway log keeps them) */
++static int glassine_latch_log = -1;
++static long long glassine_now_ms(void) {
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
++}
++#define GLASSINE_LLOG(...) do { if (glassine_latch_log > 0) wlr_log(WLR_ERROR, "glassine-latch " __VA_ARGS__); } while (0)
++
+ static void surface_commit_state(struct wlr_surface *surface,
+ 		struct wlr_surface_state *next) {
+ 	assert(next->cached_state_locks == 0);
+@@ -566,6 +581,132 @@
+ 	surface->current.buffer = NULL;
+ }
+ 
++/* glassine, latch v2 : a commit whose dma-buf the
++ * client's GPU is still writing is applied at once, as without the latch, but
++ * its fence goes on a wait list; sway does not start a repaint while the list
++ * is not empty (glassine_latch_busy) and repaints when it empties (glassine_latch_on_ready).
++ * So the composite never queues behind a client's job (40-80 ms per GTK4 frame
++ * on the A509, which switches rings only between submits), and the client sees
++ * no difference: v1 held the surface state itself (wlr_surface_lock_pending),
++ * which left Chromium's own frames with stale tiles. Opt-in:
++ * GLASSINE_FENCE_WAIT=1. A fence still unsignalled after FENCE_WAIT_MAX_MS is
++ * dropped from the list (a hung client GPU job must not freeze the output). */
++#define FENCE_WAIT_MAX_MS 1000
++
++struct glassine_fence_wait {
++	long long t0;
++	struct wlr_surface *surface;
++	int fd;
++	struct wl_event_source *fd_source, *timer;
++	struct wl_listener surface_destroy;
++};
++
++static int glassine_nwaits;
++static void (*glassine_ready_cb)(void *data);
++static void *glassine_ready_data;
++
++bool glassine_latch_busy(void);
++void glassine_latch_on_ready(void (*cb)(void *data), void *data);
++
++bool glassine_latch_busy(void) {
++	return glassine_nwaits > 0;
++}
++
++void glassine_latch_on_ready(void (*cb)(void *data), void *data) {
++	glassine_ready_cb = cb;
++	glassine_ready_data = data;
++}
++
++static void glassine_fence_wait_destroy(struct glassine_fence_wait *w, const char *why) {
++	wl_event_source_remove(w->fd_source);
++	wl_event_source_remove(w->timer);
++	close(w->fd);
++	wl_list_remove(&w->surface_destroy.link);
++	GLASSINE_LLOG("%s %p after %lld ms, %d left", why, (void *)w->surface, glassine_now_ms() - w->t0, glassine_nwaits - 1);
++	free(w);
++	if (--glassine_nwaits == 0 && glassine_ready_cb != NULL) {
++		glassine_ready_cb(glassine_ready_data);
++	}
++}
++
++static int glassine_fence_ready(int fd, uint32_t mask, void *data) {
++	glassine_fence_wait_destroy(data, "ready");
++	return 0;
++}
++
++static int glassine_fence_timeout(void *data) {
++	wlr_log(WLR_INFO, "glassine: client buffer fence not signalled after %d ms, compositing anyway",
++		FENCE_WAIT_MAX_MS);
++	glassine_fence_wait_destroy(data, "timeout");
++	return 0;
++}
++
++static void glassine_fence_surface_destroy(struct wl_listener *listener, void *data) {
++	struct glassine_fence_wait *w = wl_container_of(listener, w, surface_destroy);
++	glassine_fence_wait_destroy(w, "gone");
++}
++
++static void glassine_wait_for_buffer(struct wl_client *client, struct wlr_surface *surface) {
++	static int off = -1, force, logged;
++	if (off < 0) {
++		const char *e = getenv("GLASSINE_FENCE_WAIT"); /* opt-in (a latency trade: feel check) */
++		off = e == NULL || *e == '\0' || *e == '0';
++		e = getenv("GLASSINE_FENCE_WAIT_FORCE"); /* tests: list even a ready buffer (one loop turn) */
++		force = e != NULL && *e != '\0' && *e != '0';
++	}
++	if (glassine_latch_log < 0) {
++		const char *e = getenv("GLASSINE_LATCH_LOG");
++		glassine_latch_log = e != NULL && *e != '\0' && *e != '0';
++	}
++	struct wlr_dmabuf_attributes dmabuf;
++	if (off || !(surface->pending.committed & WLR_SURFACE_STATE_BUFFER) ||
++			surface->pending.buffer == NULL ||
++			!wlr_buffer_get_dmabuf(surface->pending.buffer, &dmabuf)) {
++		return;
++	}
++	/* the writers' fences: what a read (our composite) would wait for */
++	int fd = dmabuf_export_sync_file(dmabuf.fd[0], DMA_BUF_SYNC_READ);
++	if (fd < 0) {
++		return;
++	}
++	if (!logged) {
++		logged = 1;
++		wlr_log(WLR_INFO, "glassine: client buffer fences checked before repaints%s", force ? " (forced waits)" : "");
++	}
++	struct pollfd p = { .fd = fd, .events = POLLIN };
++	if (!force && poll(&p, 1, 0) != 0) { /* signalled (or an error): nothing to wait for */
++		close(fd);
++		return;
++	}
++	struct glassine_fence_wait *w = calloc(1, sizeof(*w));
++	if (w == NULL) {
++		close(fd);
++		return;
++	}
++	struct wl_event_loop *loop = wl_display_get_event_loop(wl_client_get_display(client));
++	w->surface = surface;
++	w->fd = fd;
++	w->fd_source = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE, glassine_fence_ready, w);
++	w->timer = wl_event_loop_add_timer(loop, glassine_fence_timeout, w);
++	if (w->fd_source == NULL || w->timer == NULL) {
++		if (w->fd_source != NULL) {
++			wl_event_source_remove(w->fd_source);
++		}
++		if (w->timer != NULL) {
++			wl_event_source_remove(w->timer);
++		}
++		close(fd);
++		free(w);
++		return;
++	}
++	wl_event_source_timer_update(w->timer, FENCE_WAIT_MAX_MS);
++	w->surface_destroy.notify = glassine_fence_surface_destroy;
++	wl_signal_add(&surface->events.destroy, &w->surface_destroy);
++	w->t0 = glassine_now_ms();
++	glassine_nwaits++;
++	GLASSINE_LLOG("wait %p buffer %p, %d waiting", (void *)surface, (void *)surface->pending.buffer, glassine_nwaits);
++}
++
+ static void surface_handle_commit(struct wl_client *client,
+ 		struct wl_resource *resource) {
+ 	struct wlr_surface *surface = wlr_surface_from_resource(resource);
+@@ -585,6 +726,8 @@
+ 		return;
+ 	}
+ 
++	glassine_wait_for_buffer(client, surface);
++
+ 	if (surface->pending.cached_state_locks > 0 || !wl_list_empty(&surface->cached)) {
+ 		surface_cache_pending(surface);
+ 	} else {

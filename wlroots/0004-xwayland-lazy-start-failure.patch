@@ -1,0 +1,48 @@
+Subject: [PATCH] glassine: xwayland: a failed lazy (re)start closes the display instead of hanging X clients
+
+Lazy Xwayland stopped spawning mid-session on the Glassine (image
+21c75cf5): sway kept /tmp/.X11-unix/X0 and @X0 listening, no Xwayland
+process, every X client hung in connect until the session restarted; the
+log had nothing (sway hides INFO). handle_client_destroy ignores
+server_start_lazy's result and xwayland_socket_connected ignores
+server_start's: on failure the listening sockets stay open with nobody
+watching them. Both now log at ERROR and close the display, so clients
+are refused instead of hanging; the lazy cycle (exit, armed, start) is
+logged too, to catch the trigger next time. Success path unchanged.
+
+--- a/xwayland/server.c
++++ b/xwayland/server.c
+@@ -211,8 +211,17 @@
+ 
+ 	if (time(NULL) - server->server_start > 5) {
+ 		if (server->options.lazy) {
+-			wlr_log(WLR_INFO, "Restarting Xwayland (lazy)");
+-			server_start_lazy(server);
++			/* glassine: logged at ERROR (sway hides INFO) so a lazy cycle can be
++			 * followed in sway.log; a failed re-arm left the X sockets
++			 * listening with no watcher: X clients hung in connect forever
++			 * . Close the display instead: they get refused */
++			wlr_log(WLR_ERROR, "glassine: Xwayland exited, lazy restart armed on %s",
++				server->display_name);
++			if (!server_start_lazy(server)) {
++				wlr_log(WLR_ERROR, "glassine: lazy Xwayland re-arm failed: closing %s",
++					server->display_name);
++				server_finish_display(server);
++			}
+ 		} else  {
+ 			wlr_log(WLR_INFO, "Restarting Xwayland");
+ 			server_start(server);
+@@ -405,7 +414,12 @@
+ 	wl_event_source_remove(server->x_fd_read_event[1]);
+ 	server->x_fd_read_event[0] = server->x_fd_read_event[1] = NULL;
+ 
+-	server_start(server);
++	wlr_log(WLR_ERROR, "glassine: X client on %s: starting Xwayland (lazy)", server->display_name);
++	if (!server_start(server)) {
++		/* glassine: as in handle_client_destroy: nobody would watch the sockets */
++		wlr_log(WLR_ERROR, "glassine: lazy Xwayland start failed: closing %s", server->display_name);
++		server_finish_display(server);
++	}
+ 
+ 	return 0;
+ }

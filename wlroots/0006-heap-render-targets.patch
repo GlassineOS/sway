@@ -1,0 +1,255 @@
+Subject: [PATCH] glassine: render targets from the system dma-heap (GLASSINE_EPD_HEAP=1)
+
+glassine-epdd-desktop's CPU ingest (ingest=cpu)
+reads sway's frames through their mapping; GBM buffers on msm map
+write-combined, so that read costs the streaming rate of uncached
+memory. With GLASSINE_EPD_HEAP=1, wlr_allocator_autocreate wraps the GBM
+allocator into one that allocates LINEAR render targets from
+/dev/dma_heap/system (cached pages) and lets gles2 import them as
+usual; GBM serves whatever the heap cannot (no LINEAR, unknown format
+size, a buffer the renderer refuses: checked with an empty render pass,
+the first refusal turns the heap off). Heap open fails: one log line,
+GBM. Off (unset or 0): wlr_allocator_autocreate returns the GBM
+allocator as before.
+
+diff -ruN a/include/render/allocator/glassine_heap.h b/include/render/allocator/glassine_heap.h
+--- a/include/render/allocator/glassine_heap.h
++++ b/include/render/allocator/glassine_heap.h
+@@ -0,0 +1,14 @@
++#ifndef RENDER_ALLOCATOR_GLASSINE_HEAP_H
++#define RENDER_ALLOCATOR_GLASSINE_HEAP_H
++
++#include <wlr/render/allocator.h>
++
++/**
++ * Glassine : with GLASSINE_EPD_HEAP=1, the allocator that renders into
++ * system dma-heap buffers (cached pages) and takes `fallback` over for what it
++ * cannot serve. Without it, or when the heap does not open: `fallback` itself.
++ */
++struct wlr_allocator *glassine_heap_allocator_wrap(struct wlr_allocator *fallback,
++	struct wlr_renderer *renderer);
++
++#endif
+diff -ruN a/render/allocator/allocator.c b/render/allocator/allocator.c
+--- a/render/allocator/allocator.c
++++ b/render/allocator/allocator.c
+@@ -11,6 +11,7 @@
+ #include "backend/backend.h"
+ #include "render/allocator/allocator.h"
+ #include "render/allocator/drm_dumb.h"
++#include "render/allocator/glassine_heap.h"
+ #include "render/allocator/shm.h"
+ #include "render/wlr_renderer.h"
+ 
+@@ -108,7 +109,9 @@
+ 			return NULL;
+ 		}
+ 		if ((alloc = wlr_gbm_allocator_create(gbm_fd)) != NULL) {
+-			return alloc;
++			/* Glassine: GLASSINE_EPD_HEAP=1 renders into dma-heap buffers (cached:
++			 * glassine-epdd-desktop reads them on the CPU), GBM for the rest; else GBM */
++			return glassine_heap_allocator_wrap(alloc, renderer);
+ 		}
+ 		close(gbm_fd);
+ 		wlr_log(WLR_DEBUG, "Failed to create gbm allocator");
+diff -ruN a/render/allocator/meson.build b/render/allocator/meson.build
+--- a/render/allocator/meson.build
++++ b/render/allocator/meson.build
+@@ -9,6 +9,7 @@
+ 	'allocator.c',
+ 	'shm.c',
+ 	'drm_dumb.c',
++	'glassine_heap.c',
+ )
+ 
+ gbm = disabler()
+diff -ruN a/render/allocator/glassine_heap.c b/render/allocator/glassine_heap.c
+--- a/render/allocator/glassine_heap.c
++++ b/render/allocator/glassine_heap.c
+@@ -0,0 +1,186 @@
++/* Glassine : sway's render targets from the system
++ * dma-heap (/dev/dma_heap/system: cached pages) instead of GBM, so glassine-epdd-desktop can
++ * read the frames on the CPU (ingest=cpu): msm maps its GEM objects
++ * write-combined ('s CPU read of a GBM frame: 72-101 ms R8, 316-328 ms XRGB
++ * on the host's VRAM BO; the A509's WC number is owed).
++ *
++ * The GPU renders into the heap buffer through gles2's own import (any
++ * dma-buf wlr_buffer: EGLImage -> renderbuffer -> FBO), LINEAR as the GBM
++ * buffers before it (the glassine-epd backend accepts LINEAR only): same layout,
++ * only the pages' CPU caching differs. No CPU access here (no data_ptr cap):
++ * the GPU is the buffer's only writer; glassine-epdd-desktop brackets its reads with
++ * DMA_BUF_IOCTL_SYNC START|READ .. END|READ (START waits for the render's
++ * implicit write fence and invalidates the CPU's lines), on the very dma-buf
++ * the backend hands it (get_dmabuf lends this fd, SCM_RIGHTS dups it).
++ *
++ * Anything the heap cannot serve -- no LINEAR in the modifier list, a format
++ * of unknown size, a buffer the renderer cannot render into (checked once per
++ * buffer with an empty render pass; the first failure turns the heap off for
++ * good), a failed allocation -- comes from the fallback (GBM). Off (no
++ * GLASSINE_EPD_HEAP): the fallback is returned as it is, nothing here runs. */
++#include <errno.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <drm_fourcc.h>
++#include <wlr/interfaces/wlr_buffer.h>
++#include <wlr/render/drm_format_set.h>
++#include <wlr/render/pass.h>
++#include <wlr/render/wlr_renderer.h>
++#include <wlr/util/log.h>
++#include "render/allocator/glassine_heap.h"
++
++#if __has_include(<linux/dma-heap.h>)
++#include <linux/dma-heap.h>
++#else
++#include <linux/types.h>
++struct dma_heap_allocation_data { __u64 len; __u32 fd; __u32 fd_flags; __u64 heap_flags; };
++#define DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0x0, struct dma_heap_allocation_data)
++#endif
++
++#define GLASSINE_HEAP_PATH "/dev/dma_heap/system"
++/* pitch: a multiple of 256 bytes (radeonsi's linear pitch; freedreno a5xx
++ * takes 64 px x cpp, a divisor of 256 for cpp <= 4: R8 1872 -> 2048, XRGB
++ * 1404 -> 5632); rows rounded up to 32 (a5xx GMEM tile height: a resolve's
++ * last tile row stays inside the pages) */
++#define GLASSINE_HEAP_PITCH 256
++#define GLASSINE_HEAP_ROWS 32
++
++struct glassine_heap_allocator {
++	struct wlr_allocator base;
++	int heap;
++	struct wlr_allocator *fallback;
++	struct wlr_renderer *renderer;
++	bool broken; /* a heap buffer was refused: the fallback from now on */
++};
++
++struct glassine_heap_buffer {
++	struct wlr_buffer base;
++	struct wlr_dmabuf_attributes dmabuf;
++};
++
++static const struct wlr_buffer_impl buffer_impl;
++static const struct wlr_allocator_interface allocator_impl;
++
++static int format_cpp(uint32_t f) {
++	switch (f) {
++	case DRM_FORMAT_R8:
++		return 1;
++	case DRM_FORMAT_GR88: case DRM_FORMAT_RG88: case DRM_FORMAT_RGB565: case DRM_FORMAT_BGR565:
++		return 2;
++	case DRM_FORMAT_XRGB8888: case DRM_FORMAT_ARGB8888: case DRM_FORMAT_XBGR8888: case DRM_FORMAT_ABGR8888:
++	case DRM_FORMAT_RGBX8888: case DRM_FORMAT_RGBA8888: case DRM_FORMAT_BGRX8888: case DRM_FORMAT_BGRA8888:
++	case DRM_FORMAT_XRGB2101010: case DRM_FORMAT_ARGB2101010: case DRM_FORMAT_XBGR2101010: case DRM_FORMAT_ABGR2101010:
++		return 4;
++	}
++	return 0;
++}
++
++static bool has_linear(const struct wlr_drm_format *f) {
++	for (size_t i = 0; i < f->len; i++) {
++		if (f->modifiers[i] == DRM_FORMAT_MOD_LINEAR) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void buffer_destroy(struct wlr_buffer *wb) {
++	struct glassine_heap_buffer *b = wl_container_of(wb, b, base);
++	wlr_dmabuf_attributes_finish(&b->dmabuf);
++	free(b);
++}
++
++static bool buffer_get_dmabuf(struct wlr_buffer *wb, struct wlr_dmabuf_attributes *out) {
++	struct glassine_heap_buffer *b = wl_container_of(wb, b, base);
++	*out = b->dmabuf; /* lent: the buffer keeps the fd */
++	return true;
++}
++
++static const struct wlr_buffer_impl buffer_impl = {
++	.destroy = buffer_destroy,
++	.get_dmabuf = buffer_get_dmabuf,
++};
++
++static struct wlr_buffer *heap_buffer(struct glassine_heap_allocator *a, int w, int h, uint32_t fourcc, int cpp) {
++	uint32_t stride = ((uint32_t)w * cpp + GLASSINE_HEAP_PITCH - 1) / GLASSINE_HEAP_PITCH * GLASSINE_HEAP_PITCH;
++	uint32_t rows = ((uint32_t)h + GLASSINE_HEAP_ROWS - 1) / GLASSINE_HEAP_ROWS * GLASSINE_HEAP_ROWS;
++	struct dma_heap_allocation_data al = { .len = (uint64_t)stride * rows, .fd_flags = O_RDWR | O_CLOEXEC };
++	if (ioctl(a->heap, DMA_HEAP_IOCTL_ALLOC, &al) < 0) {
++		wlr_log(WLR_ERROR, "glassine: dma-heap allocation of %ux%u failed (%s): this buffer from GBM",
++			stride, rows, strerror(errno));
++		return NULL;
++	}
++	struct glassine_heap_buffer *b = calloc(1, sizeof(*b));
++	if (b == NULL) {
++		close((int)al.fd);
++		return NULL;
++	}
++	wlr_buffer_init(&b->base, &buffer_impl, w, h);
++	b->dmabuf = (struct wlr_dmabuf_attributes){
++		.width = w, .height = h, .format = fourcc, .modifier = DRM_FORMAT_MOD_LINEAR,
++		.n_planes = 1, .offset = { 0 }, .stride = { stride }, .fd = { (int)al.fd, -1, -1, -1 },
++	};
++	/* can the renderer render into it (EGL import, FBO complete)? an empty
++	 * pass: the import it makes stays on the buffer for the real frames */
++	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(a->renderer, &b->base, NULL);
++	if (pass == NULL || !wlr_render_pass_submit(pass)) {
++		wlr_log(WLR_ERROR, "glassine: the renderer cannot render into a dma-heap buffer (%.4s %dx%d, pitch %u): "
++			"render targets from GBM from now on", (const char *)&fourcc, w, h, stride);
++		wlr_buffer_drop(&b->base);
++		a->broken = true;
++		return NULL;
++	}
++	return &b->base;
++}
++
++static struct wlr_buffer *allocator_create_buffer(struct wlr_allocator *wa,
++		int w, int h, const struct wlr_drm_format *format) {
++	struct glassine_heap_allocator *a = wl_container_of(wa, a, base);
++	int cpp = a->broken ? 0 : format_cpp(format->format);
++	if (cpp && has_linear(format)) {
++		struct wlr_buffer *b = heap_buffer(a, w, h, format->format, cpp);
++		if (b) {
++			return b;
++		}
++	}
++	return wlr_allocator_create_buffer(a->fallback, w, h, format);
++}
++
++static void allocator_destroy(struct wlr_allocator *wa) {
++	struct glassine_heap_allocator *a = wl_container_of(wa, a, base);
++	wlr_allocator_destroy(a->fallback);
++	close(a->heap);
++	free(a);
++}
++
++static const struct wlr_allocator_interface allocator_impl = {
++	.create_buffer = allocator_create_buffer,
++	.destroy = allocator_destroy,
++};
++
++struct wlr_allocator *glassine_heap_allocator_wrap(struct wlr_allocator *fallback,
++		struct wlr_renderer *renderer) {
++	const char *on = getenv("GLASSINE_EPD_HEAP");
++	if (fallback == NULL || on == NULL || *on == '\0' || strcmp(on, "0") == 0) {
++		return fallback;
++	}
++	int heap = open(GLASSINE_HEAP_PATH, O_RDONLY | O_CLOEXEC);
++	if (heap < 0) {
++		wlr_log(WLR_ERROR, "glassine: GLASSINE_EPD_HEAP: %s: %s: render targets from GBM", GLASSINE_HEAP_PATH, strerror(errno));
++		return fallback;
++	}
++	struct glassine_heap_allocator *a = calloc(1, sizeof(*a));
++	if (a == NULL) {
++		close(heap);
++		return fallback;
++	}
++	wlr_allocator_init(&a->base, &allocator_impl, fallback->buffer_caps & WLR_BUFFER_CAP_DMABUF);
++	a->heap = heap;
++	a->fallback = fallback;
++	a->renderer = renderer;
++	wlr_log(WLR_ERROR, "glassine: render targets from %s (cached; GBM for what it cannot serve)", GLASSINE_HEAP_PATH);
++	return &a->base;
++}
