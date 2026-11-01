@@ -629,10 +629,28 @@ static int hide_notify(void *data) {
 	return 1;
 }
 
+/*
+ * Glassine : the pointer shows on the e-ink panel (glassine-epdd-desktop paints the
+ * backend's cursor), so it must not follow the pen or a finger: tablet tool
+ * and pad activity never unhide it (as touch upstream) and hide a visible one
+ * at once (only the image: the pointer focus is the pen's emulated pointer,
+ * left to the hide timer, which clears it as before). The timer is chosen by
+ * what was used last: after touch or the pen GLASSINE_HIDE_SHORT_MS (the old seat
+ * hide_cursor 500: no hover left where the pen was), after the
+ * mouse the seat's hide_cursor. Keyboard and switch activity reach this only
+ * from seat_apply_config (every device, at start and reload): they neither
+ * unhide nor pick the timer (a power key is a keyboard: the pointer would
+ * show for the seat's timeout at every sway start).
+ */
+#define GLASSINE_HIDE_SHORT_MS 500
+
 int cursor_get_timeout(struct sway_cursor *cursor) {
 	if (cursor->pressed_button_count > 0) {
 		// Do not hide cursor unless all buttons are released
 		return 0;
+	}
+	if (cursor->glassine_short_hide) {
+		return GLASSINE_HIDE_SHORT_MS;
 	}
 
 	struct seat_config *sc = seat_get_config(cursor->seat);
@@ -694,12 +712,22 @@ static enum sway_input_idle_source idle_source_from_device(
 
 void cursor_handle_activity_from_idle_source(struct sway_cursor *cursor,
 		enum sway_input_idle_source idle_source) {
+	bool pen = idle_source == IDLE_SOURCE_TABLET_TOOL ||
+		idle_source == IDLE_SOURCE_TABLET_PAD;
+	if (pen || idle_source == IDLE_SOURCE_TOUCH) {
+		cursor->glassine_short_hide = true;
+	} else if (idle_source == IDLE_SOURCE_POINTER) {
+		cursor->glassine_short_hide = false;
+	}
 	wl_event_source_timer_update(
 			cursor->hide_source, cursor_get_timeout(cursor));
 
 	seat_idle_notify_activity(cursor->seat, idle_source);
-	if (idle_source != IDLE_SOURCE_TOUCH) {
+	if (idle_source == IDLE_SOURCE_POINTER) {
 		cursor_unhide(cursor);
+	} else if (pen && !cursor->hidden) {
+		wlr_cursor_unset_image(cursor->cursor);
+		cursor->hidden = true;
 	}
 }
 
@@ -1579,6 +1607,7 @@ struct sway_cursor *sway_cursor_create(struct sway_seat *seat) {
 
 	cursor->hide_source = wl_event_loop_add_timer(server.wl_event_loop,
 			hide_notify, cursor);
+	cursor->glassine_short_hide = true;	// Glassine: no mouse used yet
 
 	wl_list_init(&cursor->image_surface_destroy.link);
 	cursor->image_surface_destroy.notify = handle_image_surface_destroy;

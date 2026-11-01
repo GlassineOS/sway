@@ -74,6 +74,9 @@ struct sway_cursor {
 
 	struct wl_event_source *hide_source;
 	bool hidden;
+	// Glassine: the last activity was touch or the pen (or none yet): the short
+	// hide timeout (GLASSINE_HIDE_SHORT_MS), else the seat's hide_cursor
+	bool glassine_short_hide;
 	// This field is just a cache of the field in seat_config in order to avoid
 	// costly seat_config lookups on every keypress. HIDE_WHEN_TYPING_DEFAULT
 	// indicates that there is no cached value.
