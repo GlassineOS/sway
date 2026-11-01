@@ -337,6 +337,144 @@ static uint32_t get_current_time_msec(void) {
 	return now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+/*
+ * Glassine palm rejection: no touch while the pen is in range (about 1 cm above
+ * the glass) and for grace_ms after it leaves. libinput only ignores a box
+ * beside the tip while the pen reports tilt, worked out in the pen's raw mm,
+ * which on the Glassine misses the hand (the touchscreen has no resolution, its
+ * axes are turned against the pen's, and the box assumes the raw top is the
+ * user's top). Touches already down when the pen arrives are cancelled;
+ * a touch that began while blocked stays ignored until it lifts, also after
+ * the pen has left. /etc/glassine/pen-palm (read at the first use): "off", or
+ * "grace_ms N" (default 250). A pen that stops reporting for 3 s without a
+ * proximity out no longer blocks (a lost event must not leave touch dead).
+ */
+#define NA1P_MAX 16
+static int na1p_state; /* 0 unread, 1 on, -1 off */
+static uint32_t na1p_grace = 250;
+static int na1p_tools; /* tools in proximity */
+static uint32_t na1p_last, na1p_until; /* last tool event; blocked until */
+static int32_t na1p_down[NA1P_MAX]; /* touches the session got */
+static int32_t na1p_held[NA1P_MAX]; /* touches we swallow until up */
+static int na1p_ndown, na1p_nheld;
+static struct wlr_touch *na1p_touch;
+
+static bool na1p_on(void) {
+	if (!na1p_state) {
+		na1p_state = 1;
+		FILE *f = fopen("/etc/glassine/pen-palm", "r");
+		char line[64];
+		unsigned v;
+		while (f && fgets(line, sizeof line, f)) {
+			if (!strncmp(line, "off", 3)) {
+				na1p_state = -1;
+			} else if (sscanf(line, "grace_ms %u", &v) == 1) {
+				na1p_grace = v;
+			}
+		}
+		if (f) {
+			fclose(f);
+		}
+		sway_log(SWAY_INFO, "glassine: pen palm rejection %s, grace %u ms",
+			na1p_state > 0 ? "on" : "off", na1p_grace);
+	}
+	return na1p_state > 0;
+}
+
+static bool na1p_has(int32_t *ids, int n, int32_t id) {
+	for (int i = 0; i < n; i++) {
+		if (ids[i] == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void na1p_add(int32_t *ids, int *n, int32_t id) {
+	if (!na1p_has(ids, *n, id) && *n < NA1P_MAX) {
+		ids[(*n)++] = id;
+	}
+}
+
+static void na1p_del(int32_t *ids, int *n, int32_t id) {
+	for (int i = 0; i < *n; i++) {
+		if (ids[i] == id) {
+			ids[i] = ids[--(*n)];
+			return;
+		}
+	}
+}
+
+static bool na1p_blocked(void) {
+	uint32_t now = get_current_time_msec();
+	if (na1p_tools > 0 && now - na1p_last > 3000) {
+		sway_log(SWAY_DEBUG, "glassine: pen silent 3 s in proximity, touch unblocked");
+		na1p_tools = 0;
+		na1p_until = now;
+	}
+	return na1p_tools > 0 || (int32_t)(na1p_until - now) > 0;
+}
+
+/* a touch event for id: swallow it? (a new touch while blocked is held) */
+static bool na1p_swallow(int32_t id, bool down, bool up) {
+	if (!na1p_on()) {
+		return false;
+	}
+	if (na1p_has(na1p_held, na1p_nheld, id)) {
+		if (up) {
+			na1p_del(na1p_held, &na1p_nheld, id);
+		}
+		return true;
+	}
+	if (down && na1p_blocked()) {
+		na1p_add(na1p_held, &na1p_nheld, id);
+		sway_log(SWAY_DEBUG, "glassine: touch %d ignored, pen in range", id);
+		return true;
+	}
+	if (down) {
+		na1p_add(na1p_down, &na1p_ndown, id);
+	} else if (up) {
+		na1p_del(na1p_down, &na1p_ndown, id);
+	}
+	return false;
+}
+
+static void na1p_tool_event(void) {
+	na1p_last = get_current_time_msec();
+}
+
+/* the pen came into range: cancel the session's touches, hold them to the lift */
+static void na1p_pen_in(struct sway_cursor *cursor, uint32_t time_msec) {
+	if (!na1p_on()) {
+		return;
+	}
+	na1p_tools++;
+	na1p_tool_event();
+	int32_t ids[NA1P_MAX];
+	int n = na1p_ndown;
+	memcpy(ids, na1p_down, sizeof ids);
+	for (int i = 0; i < n && na1p_touch; i++) {
+		struct wlr_touch_cancel_event ev = {
+			.touch = na1p_touch, .time_msec = time_msec, .touch_id = ids[i],
+		};
+		handle_touch_cancel(&cursor->touch_cancel, &ev);
+		na1p_add(na1p_held, &na1p_nheld, ids[i]);
+	}
+	if (n) {
+		sway_log(SWAY_DEBUG, "glassine: pen in range, %d touches cancelled", n);
+	}
+}
+
+static void na1p_pen_out(void) {
+	if (!na1p_on()) {
+		return;
+	}
+	if (na1p_tools > 0) {
+		na1p_tools--;
+	}
+	na1p_until = get_current_time_msec() + na1p_grace;
+}
+
 /**
  * Returns the node at the cursor's position. If there is a surface at that
  * location, it is stored in **surface (it may not be a view).
@@ -704,6 +842,10 @@ static void handle_touch_down(struct wl_listener *listener, void *data) {
 	struct sway_cursor *cursor = wl_container_of(listener, cursor, touch_down);
 	struct wlr_touch_down_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
+	na1p_touch = event->touch;
+	if (na1p_swallow(event->touch_id, true, false)) {
+		return;
+	}
 	cursor_hide(cursor);
 
 	struct sway_seat *seat = cursor->seat;
@@ -737,6 +879,9 @@ static void handle_touch_up(struct wl_listener *listener, void *data) {
 	struct sway_cursor *cursor = wl_container_of(listener, cursor, touch_up);
 	struct wlr_touch_up_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
+	if (na1p_swallow(event->touch_id, false, true)) {
+		return;
+	}
 
 	struct sway_seat *seat = cursor->seat;
 
@@ -768,6 +913,9 @@ static void handle_touch_cancel(struct wl_listener *listener, void *data) {
 	struct sway_cursor *cursor = wl_container_of(listener, cursor, touch_cancel);
 	struct wlr_touch_cancel_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
+	if (na1p_swallow(event->touch_id, false, true)) {
+		return;
+	}
 
 	struct sway_seat *seat = cursor->seat;
 
@@ -797,6 +945,9 @@ static void handle_touch_motion(struct wl_listener *listener, void *data) {
 		wl_container_of(listener, cursor, touch_motion);
 	struct wlr_touch_motion_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
+	if (na1p_swallow(event->touch_id, false, false)) {
+		return;
+	}
 
 	struct sway_seat *seat = cursor->seat;
 
@@ -940,6 +1091,7 @@ static void handle_tool_axis(struct wl_listener *listener, void *data) {
 	struct sway_cursor *cursor = wl_container_of(listener, cursor, tool_axis);
 	struct wlr_tablet_tool_axis_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->tablet->base);
+	na1p_tool_event();
 
 	struct sway_tablet_tool *sway_tool = event->tool->data;
 	if (!sway_tool) {
@@ -996,6 +1148,7 @@ static void handle_tool_tip(struct wl_listener *listener, void *data) {
 	struct sway_cursor *cursor = wl_container_of(listener, cursor, tool_tip);
 	struct wlr_tablet_tool_tip_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->tablet->base);
+	na1p_tool_event();
 
 	struct sway_tablet_tool *sway_tool = event->tool->data;
 	struct wlr_tablet_v2_tablet *tablet_v2 = sway_tool->tablet->tablet_v2;
@@ -1066,9 +1219,11 @@ static void handle_tool_proximity(struct wl_listener *listener, void *data) {
 	}
 
 	if (event->state == WLR_TABLET_TOOL_PROXIMITY_OUT) {
+		na1p_pen_out();
 		wlr_tablet_v2_tablet_tool_notify_proximity_out(sway_tool->tablet_v2_tool);
 		return;
 	}
+	na1p_pen_in(cursor, event->time_msec);
 
 	handle_tablet_tool_position(cursor, sway_tool, true, true, event->x, event->y,
 		0, 0, event->time_msec);
