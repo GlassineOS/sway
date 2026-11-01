@@ -250,6 +250,8 @@ bool server_init(struct sway_server *server) {
 		sway_log(SWAY_ERROR, "Failed to create renderer");
 		return false;
 	}
+	/* Glassine: the panel output may composite grey (R8) with a GLES renderer */
+	wlr_multi_for_each_backend(server->backend, glassine_epd_backend_renderer, server->renderer);
 
 	server->renderer_lost.notify = handle_renderer_lost;
 	wl_signal_add(&server->renderer->events.lost, &server->renderer_lost);

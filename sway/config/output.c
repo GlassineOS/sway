@@ -23,6 +23,8 @@
 #include "sway/tree/root.h"
 #include "log.h"
 #include "util.h"
+#include <wlr/util/transform.h>
+#include "../glassine-epd-backend.h"
 
 #if WLR_HAS_DRM_BACKEND
 #include <wlr/backend/drm.h>
@@ -490,6 +492,15 @@ static void queue_output_config(struct output_config *oc,
 	} else {
 		wlr_output_state_set_render_format(pending, DRM_FORMAT_XRGB8888);
 	}
+
+	/* Glassine: the grey panel output : R8, turned into panel order;
+	 * an `output transform` (glassine-rotd) turns it further */
+	enum wl_output_transform glassine_tr;
+	if (glassine_epd_output_grey(wlr_output, &glassine_tr)) {
+		wlr_output_state_set_render_format(pending, DRM_FORMAT_R8);
+		wlr_output_state_set_transform(pending, wlr_output_transform_compose(glassine_tr,
+			oc && oc->transform >= 0 ? oc->transform : WL_OUTPUT_TRANSFORM_NORMAL));
+	}
 }
 
 static bool finalize_output_config(struct output_config *oc, struct sway_output *output) {
@@ -778,6 +789,12 @@ static bool search_render_format(struct search_context *ctx, size_t output_idx) 
 	enum render_bit_depth needed_bits = RENDER_BIT_DEPTH_8;
 	if (cfg->config && cfg->config->render_bit_depth != RENDER_BIT_DEPTH_DEFAULT) {
 		needed_bits = cfg->config->render_bit_depth;
+	}
+	if (glassine_epd_output_grey(wlr_output, NULL)) {
+		/* Glassine: R8 only (the backend offers nothing else) */
+		fmts[0] = DRM_FORMAT_R8;
+		fmts[1] = DRM_FORMAT_INVALID;
+		needed_bits = RENDER_BIT_DEPTH_DEFAULT;
 	}
 	for (size_t idx = 0; fmts[idx] != DRM_FORMAT_INVALID; idx++) {
 		enum render_bit_depth format_bits = bit_depth_from_format(fmts[idx]);
