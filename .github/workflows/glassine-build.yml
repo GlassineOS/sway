@@ -1,0 +1,10 @@
+name: glassine-build
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - run: sh build-glassine.sh "$PWD/out"
