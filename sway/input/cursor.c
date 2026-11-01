@@ -31,6 +31,305 @@
 #include "sway/tree/view.h"
 #include "sway/tree/workspace.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
+#include "sway/desktop/transaction.h"
+#include "glassine-gesture.h"
+
+/* Glassine : N-finger swipes on the touchscreen, in the compositor.
+ * One finger or two go to the apps at once; the Nth finger turns the
+ * sequence into a gesture: the apps' touches are cancelled, the rest of the
+ * sequence is swallowed, and a swipe runs an action.
+ * GLASSINE_SWIPE_FINGERS (3; 0: off), GLASSINE_SWIPE_PX (125, layout px)
+ * The actions come from $HOME/.config/glassine/gestures, which
+ * glassine-settings > Gestures writes and this reads at each swipe (no reload):
+ * lines "FINGERS DIRECTION ACTION", FINGERS 3 or 4 (a 4th finger before the
+ * swipe makes it a 4-finger one), DIRECTION up/down/left/right; a missing
+ * file or line: the defaults below. Window actions act on the window under
+ * the fingers (where the gesture began; none there: nothing):
+ * maximize the same as fullscreen (maximized and full screen were hard to tell apart in a tiling WM)
+ * minimize a fullscreen window: back from fullscreen; a maximized one:
+ * back to its tile; else to sway's scratchpad (glassine-shell
+ * lists those in its workspaces popup and brings them back)
+ * fullscreen, unfullscreen, close, swap (with the next tile),
+ * move-next, move-prev (to the next/previous workspace, and along)
+ * page-up, page-down (that key to it: wtype)
+ * the others: nothing, refresh (a full e-ink refresh), ws-next, ws-prev,
+ * overview, launcher, quick, notices (glassine-shell's popups).
+ * Two-finger tap : a right click where the fingers were, for apps
+ * whose menus only open on a mouse right click (sway has no long press =
+ * right click as glassine-touchd on X had: a hold stays the apps'). The line
+ * "2 tap ACTION" in the same file: right-click (default), nothing, or any
+ * action above (window actions: the window under the fingers).
+ * GLASSINE_TAP2_MS (400; 0: off), GLASSINE_TAP2_JOIN_MS (250), GLASSINE_TAP2_PX (15) */
+static struct glassine_gesture na1g;
+static int na1g_state; /* 0 unset, 1 on, -1 off */
+static bool na1g_internal; /* our own cancels: not fed back */
+
+static uint32_t get_current_time_msec(void);
+static struct wlr_touch *na1g_touch; /* the touchscreen (for the tap timer) */
+static struct wl_event_source *na1g_timer;
+
+static int na1g_env(const char *name, int dflt) {
+	const char *v = getenv(name);
+	return v && *v ? atoi(v) : dflt;
+}
+
+static bool na1g_on(void) {
+	if (!na1g_state) {
+		const char *px = getenv("GLASSINE_SWIPE_PX");
+		int n = na1g_env("GLASSINE_SWIPE_FINGERS", 3), tap = na1g_env("GLASSINE_TAP2_MS", 400);
+		na1g_init(&na1g, n > 0 ? n : 3, px ? atof(px) : 125);
+		if (n <= 0) {
+			na1g.fingers = NA1G_MAXPT + 1; /* no swipes: never that many fingers */
+		}
+		na1g_tap_init(&na1g, tap > 0 ? tap : -1, na1g_env("GLASSINE_TAP2_JOIN_MS", 0), na1g_env("GLASSINE_TAP2_PX", 0));
+		na1g_state = n > 0 || tap > 0 ? 1 : -1;
+		sway_log(SWAY_INFO, "glassine: touch gestures: swipes %s, two-finger tap %s",
+			n > 0 ? "on" : "off", tap > 0 ? "on" : "off");
+	}
+	return na1g_state > 0;
+}
+
+static const char *const na1g_dirs[4] = { "left", "right", "up", "down" };
+
+/* the action for a line "FINGERS WHAT ACTION" of the gestures file (dflt if none) */
+static void na1g_lookup(int fingers, const char *what, const char *dflt, char *act, size_t len) {
+	snprintf(act, len, "%s", dflt);
+	const char *home = getenv("HOME");
+	char path[512], line[256], d[16], a[64];
+	int n;
+	snprintf(path, sizeof path, "%s/.config/glassine/gestures", home ? home : "");
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return;
+	}
+	while (fgets(line, sizeof line, f)) {
+		if (sscanf(line, "%d %15s %63s", &n, d, a) == 3 && line[0] != '#'
+				&& n == fingers && !strcmp(d, what)) {
+			snprintf(act, len, "%s", a);
+		}
+	}
+	fclose(f);
+}
+
+/* the action for this many fingers and direction (index into na1g_dirs) */
+static void na1g_action(int fingers, int dir, char *act, size_t len) {
+	static const char *const dflt[2][4] = {
+		{ "ws-next", "ws-prev", "fullscreen", "minimize" },
+		{ "move-next", "move-prev", "overview", "refresh" },
+	};
+	na1g_lookup(fingers >= 4 ? 4 : 3, na1g_dirs[dir], dflt[fingers >= 4][dir], act, len);
+}
+
+/* run ACT; window actions on the window at x, y. what: for the log */
+static void na1g_run(struct sway_seat *seat, const char *act, double x, double y, const char *what) {
+	static const struct { const char *act, *cmd; } global[] = {
+		{ "refresh", "exec /usr/bin/glassine-refresh" },
+		{ "ws-next", "workspace next_on_output" },
+		{ "ws-prev", "workspace prev_on_output" },
+		{ "overview", "exec /usr/bin/glassine-shell-wl toggle workspaces" },
+		{ "launcher", "exec /usr/bin/glassine-shell-wl toggle launcher" },
+		{ "quick", "exec /usr/bin/glassine-shell-wl toggle quick" },
+		{ "notices", "exec /usr/bin/glassine-shell-wl toggle notices" },
+	};
+	char buf[512], nbuf[128];
+	const char *cmd = NULL;
+	for (size_t i = 0; i < sizeof global / sizeof *global; i++) {
+		if (!strcmp(act, global[i].act)) {
+			cmd = global[i].cmd;
+		}
+	}
+	if (!cmd && strcmp(act, "nothing")) {
+		struct wlr_surface *surface = NULL;
+		double sx, sy;
+		struct sway_node *node = node_at_coords(seat, x, y, &surface, &sx, &sy);
+		struct sway_container *con = node && node->type == N_CONTAINER ? node->sway_container : NULL;
+		if (!con || !con->view) {
+			sway_log(SWAY_DEBUG, "glassine: %s (%s) at %.0f,%.0f: no window there", what, act, x, y);
+			return;
+		}
+		bool full = con->pending.fullscreen_mode != FULLSCREEN_NONE;
+		bool max = container_has_mark(con, "na1max");
+		const char *c = NULL;
+		if (!strcmp(act, "maximize")) {
+			c = "fullscreen enable";
+			/* (was: a floating window filling the workspace, marked na1max; minimize still restores one) */
+		} else if (!strcmp(act, "minimize")) {
+			c = full ? "fullscreen disable" : max ? "floating disable, unmark na1max" : "move scratchpad";
+		} else if (!strcmp(act, "fullscreen")) {
+			c = "fullscreen enable";
+		} else if (!strcmp(act, "unfullscreen")) {
+			c = "fullscreen disable";
+		} else if (!strcmp(act, "close")) {
+			c = "kill";
+		} else if (!strcmp(act, "move-next") || !strcmp(act, "move-prev")) {
+			/* past the last workspace a new one, no wrap-around
+			 * (the last one's window then went to the first); move-prev on the first:
+			 * nothing. A window alone on the last one stays (a new one = the same) */
+			bool next = !strcmp(act, "move-next");
+			struct sway_workspace *ws = con->pending.workspace;
+			struct sway_output *op = ws ? ws->output : NULL;
+			int i = op ? list_find(op->workspaces, ws) : -1;
+			if (i < 0) {
+				c = NULL;
+			} else if (next ? i < op->workspaces->length - 1 : i > 0) {
+				c = next ? "move container to workspace next_on_output; workspace next_on_output"
+					: "move container to workspace prev_on_output; workspace prev_on_output";
+			} else if (next && workspace_num_tiling_views(ws) + (size_t)ws->floating->length > 1) {
+				int maxn = 0;
+				for (int o = 0; o < root->outputs->length; o++) {
+					struct sway_output *x = root->outputs->items[o];
+					for (int w = 0; w < x->workspaces->length; w++) {
+						struct sway_workspace *y = x->workspaces->items[w];
+						int n = atoi(y->name);
+						maxn = n > maxn ? n : maxn;
+					}
+				}
+				snprintf(nbuf, sizeof nbuf, "move container to workspace number %d; workspace number %d",
+					maxn + 1, maxn + 1);
+				c = nbuf;
+			}
+		} else if (!strcmp(act, "swap") && !container_is_floating(con)) {
+			list_t *sib = container_get_siblings(con);
+			if (sib && sib->length > 1) {
+				struct sway_container *o = sib->items[(container_sibling_index(con) + 1) % sib->length];
+				snprintf(buf, sizeof buf, "[con_id=%zu] swap container with con_id %zu",
+					con->node.id, o->node.id);
+				cmd = buf;
+			}
+		} else if (!strcmp(act, "page-up") || !strcmp(act, "page-down")) {
+			/* a Page Up/Down key for the window under the
+			 * fingers (focused first; wtype types it through a virtual keyboard) */
+			c = !strcmp(act, "page-up") ? "focus; exec wtype -k Prior" : "focus; exec wtype -k Next";
+		}
+		if (c) {
+			snprintf(buf, sizeof buf, "[con_id=%zu] %s", con->node.id, c);
+			cmd = buf;
+		}
+	}
+	if (!cmd) {
+		sway_log(SWAY_DEBUG, "glassine: %s: %s, nothing to do", what, act);
+		return;
+	}
+	sway_log(SWAY_DEBUG, "glassine: %s (%s): %s", what, act, cmd);
+	struct sway_binding binding = { .type = BINDING_KEYSYM, .command = (char *)cmd };
+	seat_execute_command(seat, &binding);
+	transaction_commit_dirty();
+}
+
+static void na1g_command(struct sway_seat *seat, enum na1g_result r) {
+	int dir = r - NA1G_SWIPE_LEFT, fingers = na1g.most;
+	char act[64], what[64];
+	na1g_action(fingers, dir, act, sizeof act);
+	snprintf(what, sizeof what, "%d-finger swipe %s", fingers, na1g_dirs[dir]);
+	na1g_run(seat, act, na1g.cx, na1g.cy, what);
+}
+
+static void handle_touch_cancel(struct wl_listener *listener, void *data);
+static void handle_touch_up(struct wl_listener *listener, void *data);
+static void handle_touch_frame(struct wl_listener *listener, void *data);
+
+/* an up the gesture held back, to the apps now */
+static void na1g_up_to_apps(struct sway_cursor *cursor, struct wlr_touch *touch,
+		uint32_t time_msec, int32_t id) {
+	struct wlr_touch_up_event ev = { .touch = touch, .time_msec = time_msec, .touch_id = id };
+	na1g_internal = true;
+	handle_touch_up(&cursor->touch_up, &ev);
+	na1g_internal = false;
+}
+
+/* the ups held back for a tap that did not come: to the apps, before the
+ * event that told */
+static void na1g_flush_ups(struct sway_cursor *cursor, struct wlr_touch *touch, uint32_t time_msec) {
+	int32_t ids[NA1G_MAXPT];
+	int n = na1g_flush(&na1g, ids, NA1G_MAXPT);
+	for (int i = 0; i < n; i++) {
+		na1g_up_to_apps(cursor, touch, time_msec, ids[i]);
+	}
+	if (n) {
+		sway_log(SWAY_DEBUG, "glassine: no two-finger tap, %d held-back up(s) delivered", n);
+	}
+}
+
+static int na1g_timer_fired(void *data) {
+	struct sway_cursor *cursor = data;
+	na1g_clock(&na1g, get_current_time_msec());
+	if (na1g_touch && na1g_tick(&na1g)) {
+		na1g_flush_ups(cursor, na1g_touch, get_current_time_msec());
+		handle_touch_frame(&cursor->touch_frame, NULL);
+	}
+	return 0;
+}
+
+/* after each touch event: a held-back up times out on its own */
+static void na1g_timer_update(struct sway_cursor *cursor) {
+	uint32_t ms = na1g_hold_ms(&na1g);
+	if (!na1g_timer && ms) {
+		na1g_timer = wl_event_loop_add_timer(server.wl_event_loop, na1g_timer_fired, cursor);
+	}
+	if (na1g_timer) {
+		wl_event_source_timer_update(na1g_timer, ms);
+	}
+}
+
+/* the apps' sequence ends (the gesture took it); an app that only gets a
+ * pointer from touch (sway simulates one) gets its left button released */
+static void na1g_cancel_ids(struct sway_cursor *cursor, struct wlr_touch *touch,
+		uint32_t time_msec, const int32_t *ids, int n) {
+	if (cursor->simulating_pointer_from_touch) {
+		if (!cursor->pointer_touch_up) {
+			cursor->pointer_touch_up = true;
+			dispatch_cursor_button(cursor, &touch->base, time_msec, BTN_LEFT,
+				WL_POINTER_BUTTON_STATE_RELEASED);
+		}
+		return;
+	}
+	na1g_internal = true;
+	for (int i = 0; i < n; i++) {
+		struct wlr_touch_cancel_event ev = {
+			.touch = touch, .time_msec = time_msec, .touch_id = ids[i],
+		};
+		handle_touch_cancel(&cursor->touch_cancel, &ev);
+	}
+	na1g_internal = false;
+}
+
+/* a two-finger tap: by default a right click at the tap */
+static void na1g_tap(struct sway_cursor *cursor, struct wlr_touch *touch, uint32_t time_msec) {
+	char act[64];
+	na1g_lookup(2, "tap", "right-click", act, sizeof act);
+	if (!strcmp(act, "nothing")) {
+		for (int i = 0; i < na1g.ntap; i++) {
+			na1g_up_to_apps(cursor, touch, time_msec, na1g.tap_ids[i]);
+		}
+		sway_log(SWAY_DEBUG, "glassine: two-finger tap at %.0f,%.0f: nothing", na1g.tx, na1g.ty);
+		return;
+	}
+	na1g_cancel_ids(cursor, touch, time_msec, na1g.tap_ids, na1g.ntap);
+	if (strcmp(act, "right-click")) {
+		na1g_run(cursor->seat, act, na1g.tx, na1g.ty, "two-finger tap");
+		return;
+	}
+	sway_log(SWAY_DEBUG, "glassine: two-finger tap at %.0f,%.0f: right click", na1g.tx, na1g.ty);
+	double dx = na1g.tx - cursor->cursor->x, dy = na1g.ty - cursor->cursor->y;
+	pointer_motion(cursor, time_msec, &touch->base, dx, dy, dx, dy);
+	dispatch_cursor_button(cursor, &touch->base, time_msec, BTN_RIGHT, WL_POINTER_BUTTON_STATE_PRESSED);
+	dispatch_cursor_button(cursor, &touch->base, time_msec, BTN_RIGHT, WL_POINTER_BUTTON_STATE_RELEASED);
+	wlr_seat_pointer_notify_frame(cursor->seat->wlr_seat);
+}
+
+/* the gesture took over: cancel what the apps hold (all but the new finger) */
+static void na1g_cancel_apps(struct sway_cursor *cursor, struct wlr_touch *touch,
+		uint32_t time_msec, int32_t new_id) {
+	int32_t ids[NA1G_MAXPT];
+	int n = na1g_points(&na1g, ids, NA1G_MAXPT), k = 0;
+	for (int i = 0; i < n; i++) {
+		if (ids[i] != new_id) {
+			ids[k++] = ids[i];
+		}
+	}
+	na1g_cancel_ids(cursor, touch, time_msec, ids, k);
+	sway_log(SWAY_DEBUG, "glassine: %d-finger gesture, %d app touches cancelled", n, n - 1);
+}
 
 static uint32_t get_current_time_msec(void) {
 	struct timespec now;
@@ -413,6 +712,20 @@ static void handle_touch_down(struct wl_listener *listener, void *data) {
 	wlr_cursor_absolute_to_layout_coords(cursor->cursor, &event->touch->base,
 			event->x, event->y, &lx, &ly);
 
+	if (na1g_on()) {
+		na1g_touch = event->touch;
+		na1g_clock(&na1g, event->time_msec);
+		enum na1g_result r = na1g_down(&na1g, event->touch_id, lx, ly);
+		na1g_flush_ups(cursor, event->touch, event->time_msec);
+		na1g_timer_update(cursor);
+		if (r == NA1G_CANCEL) {
+			na1g_cancel_apps(cursor, event->touch, event->time_msec, event->touch_id);
+		}
+		if (r != NA1G_PASS) {
+			return;
+		}
+	}
+
 	seat->touch_id = event->touch_id;
 	seat->touch_x = lx;
 	seat->touch_y = ly;
@@ -426,6 +739,19 @@ static void handle_touch_up(struct wl_listener *listener, void *data) {
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
 
 	struct sway_seat *seat = cursor->seat;
+
+	if (!na1g_internal && na1g_on()) {
+		na1g_clock(&na1g, event->time_msec);
+		enum na1g_result r = na1g_up(&na1g, event->touch_id);
+		na1g_flush_ups(cursor, event->touch, event->time_msec);
+		na1g_timer_update(cursor);
+		if (r == NA1G_TAP2) {
+			na1g_tap(cursor, event->touch, event->time_msec);
+		}
+		if (r != NA1G_PASS) {
+			return;
+		}
+	}
 
 	if (cursor->simulating_pointer_from_touch) {
 		if (cursor->pointer_touch_id == cursor->seat->touch_id) {
@@ -444,6 +770,16 @@ static void handle_touch_cancel(struct wl_listener *listener, void *data) {
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
 
 	struct sway_seat *seat = cursor->seat;
+
+	if (!na1g_internal && na1g_on()) {
+		na1g_clock(&na1g, event->time_msec);
+		enum na1g_result r = na1g_cancel(&na1g, event->touch_id);
+		na1g_flush_ups(cursor, event->touch, event->time_msec);
+		na1g_timer_update(cursor);
+		if (r != NA1G_PASS) {
+			return;
+		}
+	}
 
 	if (cursor->simulating_pointer_from_touch) {
 		if (cursor->pointer_touch_id == cursor->seat->touch_id) {
@@ -467,6 +803,19 @@ static void handle_touch_motion(struct wl_listener *listener, void *data) {
 	double lx, ly;
 	wlr_cursor_absolute_to_layout_coords(cursor->cursor, &event->touch->base,
 			event->x, event->y, &lx, &ly);
+
+	if (na1g_on()) {
+		na1g_clock(&na1g, event->time_msec);
+		enum na1g_result r = na1g_motion(&na1g, event->touch_id, lx, ly);
+		na1g_flush_ups(cursor, event->touch, event->time_msec);
+		na1g_timer_update(cursor);
+		if (r >= NA1G_SWIPE_LEFT && r <= NA1G_SWIPE_DOWN) {
+			na1g_command(seat, r);
+		}
+		if (r != NA1G_PASS) {
+			return;
+		}
+	}
 
 	if (seat->touch_id == event->touch_id) {
 		seat->touch_x = lx;

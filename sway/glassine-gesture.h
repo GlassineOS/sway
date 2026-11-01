@@ -1,0 +1,88 @@
+/* glassine-gesture.h — the compositor-side touch gestures of the Glassine sway session
+ * (. Pure logic, no wlroots: sway's
+ * touch handlers (0002-glassine-touch-gestures.patch) feed every touch event in and
+ * do what comes back.
+ *
+ * Touches go to the apps at once (no holding back as glassine-touchd does on X;
+ * apps handle tap, drag and long press themselves). When the Nth finger lands
+ * (N = fingers, 3), the sequence becomes a gesture: the apps' touches are
+ * cancelled (wl_touch.cancel), and every touch event until the last finger is
+ * up is swallowed. A move of the fingers' centroid by swipe_px (layout
+ * coordinates) fires the swipe once, by its main direction: left or right
+ * (workspaces), up or down (maximize, minimize). cx, cy: where
+ * the gesture started (the centroid when the Nth finger landed): the window
+ * it acts on. most: the fingers down at most before the swipe fired (3 or 4:
+ * which set of actions; a finger that lands before the swipe restarts the
+ * travel, so a 4-finger swipe counts from its 4th finger).
+ *
+ * Two-finger tap (user: the X session's long press = right click
+ * has no equal under sway; a hold stays the apps'): exactly two fingers, the
+ * 2nd down within tap_join_ms of the 1st, neither moving tap_px, both up
+ * within tap_ms of the 1st down. The apps get both touches at once as usual;
+ * only the up of the first finger to lift is held back while the tap is still
+ * possible (else the app would see a finished one-finger tap). The last up
+ * then returns NA1G_TAP2: the glue cancels the apps' sequence (tap_ids) and
+ * runs the tap's action at (tx, ty), the fingers' centroid when the 2nd
+ * landed. Once the tap is impossible (a move, a 3rd finger, too slow), the
+ * held-back up is due: the glue delivers what na1g_flush returns before it
+ * acts on the event. "Too slow" is noticed at the next touch event, or by the
+ * glue's timer (na1g_hold_ms, na1g_tick). na1g_clock sets the time of the
+ * events. */
+#ifndef GLASSINE_GESTURE_H
+#define GLASSINE_GESTURE_H
+#include <stdint.h>
+
+#define NA1G_MAXPT 10
+
+enum na1g_result {
+    NA1G_PASS,          /* hand the event to the apps as usual */
+    NA1G_SWALLOW,       /* drop it */
+    NA1G_CANCEL,        /* drop it, and cancel the apps' touch sequence now */
+    NA1G_SWIPE_LEFT,    /* drop it; the fingers moved left: run the "left" action */
+    NA1G_SWIPE_RIGHT,
+    NA1G_SWIPE_UP,
+    NA1G_SWIPE_DOWN,
+    NA1G_TAP2,          /* drop it; a two-finger tap: cancel tap_ids, run the tap at tx, ty */
+};
+
+struct glassine_gesture {
+    int fingers;        /* touches that make a gesture (3) */
+    double swipe_px;    /* centroid travel for a swipe */
+    /* state */
+    int n;
+    struct { int32_t id; double x, y, x0, y0; } pt[NA1G_MAXPT];
+    int active, fired;  /* in a gesture / its swipe fired */
+    double cx, cy;      /* the centroid when the gesture began */
+    int most;           /* the most fingers down in this gesture before its swipe */
+    /* two-finger tap */
+    uint32_t tap_ms, tap_join_ms;   /* first down to last up (400) / to the 2nd down (250) */
+    double tap_px;      /* the most a tapping finger may move (15) */
+    uint32_t now, t0;   /* the event's time (na1g_clock) / the sequence's first down */
+    int tap;            /* 1: one finger, may become a tap; 2: two fingers; 0: not a tap */
+    double tx, ty;
+    int nheld, nflush, ntap;
+    int32_t held[NA1G_MAXPT], flush[NA1G_MAXPT], tap_ids[NA1G_MAXPT];
+};
+
+void na1g_init(struct glassine_gesture *g, int fingers, double swipe_px);
+/* the two-finger tap's limits (0: keep the default; it is on after na1g_init);
+ * tap_ms < 0: off */
+void na1g_tap_init(struct glassine_gesture *g, int tap_ms, int join_ms, double px);
+/* the time (ms) of the event about to be fed in */
+void na1g_clock(struct glassine_gesture *g, uint32_t ms);
+/* no event since: is the held-back up due now (at the time of na1g_clock)?
+ * 1: the tap timed out, deliver na1g_flush's ups. hold_ms: how long the tap
+ * can still come (for a timer; 0: nothing held) */
+int na1g_tick(struct glassine_gesture *g);
+uint32_t na1g_hold_ms(const struct glassine_gesture *g);
+/* ups held back for a tap that will not come: deliver these first (returns how many) */
+int na1g_flush(struct glassine_gesture *g, int32_t *ids, int max);
+enum na1g_result na1g_down(struct glassine_gesture *g, int32_t id, double x, double y);
+enum na1g_result na1g_motion(struct glassine_gesture *g, int32_t id, double x, double y);
+enum na1g_result na1g_up(struct glassine_gesture *g, int32_t id);
+/* the device cancelled its touches: forget them all (PASS unless in a gesture) */
+enum na1g_result na1g_cancel(struct glassine_gesture *g, int32_t id);
+/* the ids the apps still hold (to cancel them): returns how many */
+int na1g_points(const struct glassine_gesture *g, int32_t *ids, int max);
+
+#endif
