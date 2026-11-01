@@ -54,6 +54,7 @@
 #include "sway/input/input-manager.h"
 #include "sway/output.h"
 #include "sway/server.h"
+#include "glassine-epd-backend.h"
 #include "sway/input/cursor.h"
 #include "sway/tree/root.h"
 
@@ -217,6 +218,9 @@ static void handle_renderer_lost(struct wl_listener *listener, void *data) {
 bool server_init(struct sway_server *server) {
 	sway_log(SWAY_DEBUG, "Initializing Wayland server");
 	server->wl_display = wl_display_create();
+	/* Glassine: a stopped client (glassine-bgprio freezes hidden apps) must not be
+	 * dropped once 4 KiB of events wait for it (libwayland's default max) */
+	wl_display_set_default_max_buffer_size(server->wl_display, 4 << 20);
 	server->wl_event_loop = wl_display_get_event_loop(server->wl_display);
 
 	wl_display_set_global_filter(server->wl_display, filter_global, NULL);
@@ -227,6 +231,16 @@ bool server_init(struct sway_server *server) {
 	if (!server->backend) {
 		sway_log(SWAY_ERROR, "Unable to create backend");
 		return false;
+	}
+
+	/* Glassine: the e-ink panel as an output (frames to glassine-epdd-desktop), added before the
+	 * renderer and allocator are chosen: its SHM-only caps make the buffers memfd */
+	if (getenv("GLASSINE_EPD")) {
+		struct wlr_backend *epd = glassine_epd_backend_create(server->wl_event_loop);
+		if (!epd || !wlr_multi_backend_add(server->backend, epd)) {
+			sway_log(SWAY_ERROR, "Unable to create the glassine-epd backend");
+			return false;
+		}
 	}
 
 	wlr_multi_for_each_backend(server->backend, detect_proprietary, NULL);
