@@ -259,6 +259,32 @@ static bool output_can_tear(struct sway_output *output) {
 	return false;
 }
 
+/* glassine latch v2 (our wlroots 0002, GLASSINE_FENCE_WAIT=1): while an app's GPU job
+ * still writes a buffer committed for display, the repaint waits and runs when
+ * the last such job is done, so the composite never queues behind it. At most
+ * GLASSINE_LATCH_MAX_MS per repaint: apps that keep committing busy buffers must not
+ * starve the output */
+#define GLASSINE_LATCH_MAX_MS 50
+bool glassine_latch_busy(void);
+void glassine_latch_on_ready(void (*cb)(void *data), void *data);
+static struct sway_output *glassine_latch_deferred;
+static long long glassine_latch_since = -1; /* the deferred repaint's first try (ms) */
+
+static long long glassine_latch_now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
+static void glassine_latch_ready(void *data) {
+	struct sway_output *output = glassine_latch_deferred;
+	glassine_latch_deferred = NULL;
+	if (output != NULL && output->enabled && output->wlr_output != NULL) {
+		wl_event_source_timer_update(output->repaint_timer, 0); /* the cap's timer */
+		wlr_output_schedule_frame(output->wlr_output);
+	}
+}
+
 static int output_repaint_timer_handler(void *data) {
 	struct sway_output *output = data;
 
@@ -266,6 +292,20 @@ static int output_repaint_timer_handler(void *data) {
 	if (!output->enabled) {
 		return 0;
 	}
+	if (glassine_latch_busy()) {
+		long long now = glassine_latch_now_ms();
+		if (glassine_latch_since < 0) {
+			glassine_latch_since = now;
+		}
+		if (now - glassine_latch_since < GLASSINE_LATCH_MAX_MS) {
+			glassine_latch_deferred = output;
+			glassine_latch_on_ready(glassine_latch_ready, NULL);
+			wl_event_source_timer_update(output->repaint_timer,
+				(int)(glassine_latch_since + GLASSINE_LATCH_MAX_MS - now));
+			return 0;
+		}
+	}
+	glassine_latch_since = -1;
 
 	output_configure_scene(output, &root->root_scene->tree.node, 1.0f);
 
@@ -461,6 +501,9 @@ static void begin_destroy(struct sway_output *output) {
 
 	wl_event_source_remove(output->repaint_timer);
 	output->repaint_timer = NULL;
+	if (glassine_latch_deferred == output) {
+		glassine_latch_deferred = NULL;
+	}
 
 	request_modeset();
 }
