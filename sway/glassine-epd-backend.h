@@ -7,7 +7,7 @@
 #include <wayland-server-protocol.h>
 #include <wlr/backend.h>
 
-/* one output, Note Air 1-EPD-1: the portrait panel (GLASSINE_EPD_SIZE=WxH overrides
+/* one output, EPD-1: the portrait panel (GLASSINE_EPD_SIZE=WxH overrides
  * 1404x1872, for host tests); frames go to glassine-epdd-desktop over GLASSINE_EPD_SOCK */
 struct wlr_backend *glassine_epd_backend_create(struct wl_event_loop *loop);
 bool glassine_epd_backend_is(struct wlr_backend *backend);

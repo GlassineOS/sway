@@ -3,29 +3,29 @@
 #include <math.h>
 #include <string.h>
 
-void na1g_init(struct glassine_gesture *g, int fingers, double swipe_px)
+void glassine_g_init(struct glassine_gesture *g, int fingers, double swipe_px)
 {
     memset(g, 0, sizeof *g);
-    g->fingers = fingers < 2 ? 2 : fingers > NA1G_MAXPT ? NA1G_MAXPT : fingers;
+    g->fingers = fingers < 2 ? 2 : fingers > GLASSINE_G_MAXPT ? GLASSINE_G_MAXPT : fingers;
     g->swipe_px = swipe_px > 0 ? swipe_px : 125;
     g->tap_ms = 400;
     g->tap_join_ms = 250;
     g->tap_px = 15;
 }
 
-void na1g_tap_init(struct glassine_gesture *g, int tap_ms, int join_ms, double px)
+void glassine_g_tap_init(struct glassine_gesture *g, int tap_ms, int join_ms, double px)
 {
     if (tap_ms) g->tap_ms = tap_ms < 0 ? 0 : (uint32_t)tap_ms;
     if (join_ms > 0) g->tap_join_ms = join_ms;
     if (px > 0) g->tap_px = px;
 }
 
-void na1g_clock(struct glassine_gesture *g, uint32_t ms)
+void glassine_g_clock(struct glassine_gesture *g, uint32_t ms)
 {
     g->now = ms;
 }
 
-int na1g_flush(struct glassine_gesture *g, int32_t *ids, int max)
+int glassine_g_flush(struct glassine_gesture *g, int32_t *ids, int max)
 {
     int k = 0;
     for (int i = 0; i < g->nflush && k < max; i++) ids[k++] = g->flush[i];
@@ -36,14 +36,14 @@ int na1g_flush(struct glassine_gesture *g, int32_t *ids, int max)
 static void tap_fail(struct glassine_gesture *g);
 static int tap_late(const struct glassine_gesture *g);
 
-int na1g_tick(struct glassine_gesture *g)
+int glassine_g_tick(struct glassine_gesture *g)
 {
     if (!g->nheld || !tap_late(g)) return 0;
     tap_fail(g);
     return 1;
 }
 
-uint32_t na1g_hold_ms(const struct glassine_gesture *g)
+uint32_t glassine_g_hold_ms(const struct glassine_gesture *g)
 {
     if (!g->nheld) return 0;
     uint32_t used = g->now - g->t0;
@@ -53,7 +53,7 @@ uint32_t na1g_hold_ms(const struct glassine_gesture *g)
 /* the tap will not come: the held-back up is due */
 static void tap_fail(struct glassine_gesture *g)
 {
-    for (int i = 0; i < g->nheld && g->nflush < NA1G_MAXPT; i++) g->flush[g->nflush++] = g->held[i];
+    for (int i = 0; i < g->nheld && g->nflush < GLASSINE_G_MAXPT; i++) g->flush[g->nflush++] = g->held[i];
     g->nheld = 0;
     g->tap = 0;
 }
@@ -84,11 +84,11 @@ static void travel(const struct glassine_gesture *g, double *dx, double *dy)
     if (g->n) { *dx /= g->n; *dy /= g->n; }
 }
 
-enum na1g_result na1g_down(struct glassine_gesture *g, int32_t id, double x, double y)
+enum glassine_g_result glassine_g_down(struct glassine_gesture *g, int32_t id, double x, double y)
 {
     int i = find(g, id);
     if (i < 0) {
-        if (g->n == NA1G_MAXPT) return g->active ? NA1G_SWALLOW : NA1G_PASS;
+        if (g->n == GLASSINE_G_MAXPT) return g->active ? GLASSINE_G_SWALLOW : GLASSINE_G_PASS;
         i = g->n++;
     }
     g->pt[i].id = id;
@@ -109,7 +109,7 @@ enum na1g_result na1g_down(struct glassine_gesture *g, int32_t id, double x, dou
             g->most = g->n;
             for (int k = 0; k < g->n; k++) { g->pt[k].x0 = g->pt[k].x; g->pt[k].y0 = g->pt[k].y; }
         }
-        return NA1G_SWALLOW;
+        return GLASSINE_G_SWALLOW;
     }
     if (g->n >= g->fingers) {
         g->most = g->n;
@@ -120,35 +120,35 @@ enum na1g_result na1g_down(struct glassine_gesture *g, int32_t id, double x, dou
             g->pt[k].x0 = g->pt[k].x; g->pt[k].y0 = g->pt[k].y;
             g->cx += g->pt[k].x / g->n; g->cy += g->pt[k].y / g->n;
         }
-        return NA1G_CANCEL;
+        return GLASSINE_G_CANCEL;
     }
-    return NA1G_PASS;
+    return GLASSINE_G_PASS;
 }
 
-enum na1g_result na1g_motion(struct glassine_gesture *g, int32_t id, double x, double y)
+enum glassine_g_result glassine_g_motion(struct glassine_gesture *g, int32_t id, double x, double y)
 {
     int i = find(g, id);
-    if (i < 0) return g->active ? NA1G_SWALLOW : NA1G_PASS;
+    if (i < 0) return g->active ? GLASSINE_G_SWALLOW : GLASSINE_G_PASS;
     g->pt[i].x = x;
     g->pt[i].y = y;
     if (g->tap && (fabs(x - g->pt[i].x0) > g->tap_px || fabs(y - g->pt[i].y0) > g->tap_px || tap_late(g)))
         tap_fail(g);
-    if (!g->active) return NA1G_PASS;
-    if (g->fired) return NA1G_SWALLOW;
+    if (!g->active) return GLASSINE_G_PASS;
+    if (g->fired) return GLASSINE_G_SWALLOW;
     double dx, dy;
     travel(g, &dx, &dy);
     if (fabs(dx) >= g->swipe_px && fabs(dx) > fabs(dy)) {
         g->fired = 1;
-        return dx < 0 ? NA1G_SWIPE_LEFT : NA1G_SWIPE_RIGHT;
+        return dx < 0 ? GLASSINE_G_SWIPE_LEFT : GLASSINE_G_SWIPE_RIGHT;
     }
     if (fabs(dy) >= g->swipe_px && fabs(dy) > fabs(dx)) {
         g->fired = 1;
-        return dy < 0 ? NA1G_SWIPE_UP : NA1G_SWIPE_DOWN;
+        return dy < 0 ? GLASSINE_G_SWIPE_UP : GLASSINE_G_SWIPE_DOWN;
     }
-    return NA1G_SWALLOW;
+    return GLASSINE_G_SWALLOW;
 }
 
-enum na1g_result na1g_up(struct glassine_gesture *g, int32_t id)
+enum glassine_g_result glassine_g_up(struct glassine_gesture *g, int32_t id)
 {
     int active = g->active, i = find(g, id);
     if (i >= 0 && g->tap) {
@@ -157,29 +157,29 @@ enum na1g_result na1g_up(struct glassine_gesture *g, int32_t id)
         } else if (g->n == 2) {                     /* the first of the two: hold its up back */
             g->held[g->nheld++] = id;
             drop(g, i);
-            return NA1G_SWALLOW;
+            return GLASSINE_G_SWALLOW;
         } else if (g->n == 1 && g->nheld == 1) {    /* the second: a tap */
             g->ntap = 0;
             g->tap_ids[g->ntap++] = g->held[0];
             g->tap_ids[g->ntap++] = id;
             g->nheld = 0;
             drop(g, i);
-            return NA1G_TAP2;
+            return GLASSINE_G_TAP2;
         } else {
             tap_fail(g);
         }
     }
     if (i >= 0) drop(g, i);
-    return active ? NA1G_SWALLOW : NA1G_PASS;
+    return active ? GLASSINE_G_SWALLOW : GLASSINE_G_PASS;
 }
 
-enum na1g_result na1g_cancel(struct glassine_gesture *g, int32_t id)
+enum glassine_g_result glassine_g_cancel(struct glassine_gesture *g, int32_t id)
 {
     if (g->tap) tap_fail(g);
-    return na1g_up(g, id);
+    return glassine_g_up(g, id);
 }
 
-int na1g_points(const struct glassine_gesture *g, int32_t *ids, int max)
+int glassine_g_points(const struct glassine_gesture *g, int32_t *ids, int max)
 {
     int k = 0;
     for (int i = 0; i < g->n && k < max; i++) ids[k++] = g->pt[i].id;

@@ -1,7 +1,7 @@
 /* glassine-epd-backend.c — the Glassine e-ink panel as a wlroots 0.18 output, built into
  * the patched sway (tools/pmos-glassine/sway/). Protocol: glassine-epd-output-proto.h.
  *
- * One output, Note Air 1-EPD-1 (portrait 1404x1872; GLASSINE_EPD_SIZE=WxH for host tests).
+ * One output, EPD-1 (portrait 1404x1872; GLASSINE_EPD_SIZE=WxH for host tests).
  * Buffer caps: SHM and DMABUF. With the pixman renderer sway's allocator makes
  * memfd buffers; with GLES (WLR_RENDERER=gles2) GBM buffers on the
  * render node, LINEAR XRGB8888/ARGB8888 only (the primary formats), which go to
@@ -823,7 +823,7 @@ static bool backend_start(struct wlr_backend *b)
     wlr_output_state_set_custom_mode(&st, be->w, be->h, hz > 0 ? hz * 1000 : 0);
     wlr_output_init(&o->base, &be->base, getenv("GLASSINE_EPD_CURSOR") ? &output_impl_swcursor : &output_impl, be->loop, &st);
     wlr_output_state_finish(&st);
-    wlr_output_set_name(&o->base, "Note Air 1-EPD-1");
+    wlr_output_set_name(&o->base, "EPD-1");
     wlr_output_set_description(&o->base, "Glassine e-ink panel (glassine-epdd-desktop)");
     o->base.phys_width = be->grey ? 209 : 157;     /* mm, 10.3" 4:3 at 227 dpi, of the mode */
     o->base.phys_height = be->grey ? 157 : 209;
