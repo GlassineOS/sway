@@ -19,6 +19,7 @@ protocols = [
 	'idle.xml',
 	'wlr-output-power-management-unstable-v1.xml',
 	'glassine-ink-v1.xml',
+	'na1-ink-v1.xml',
 ]
 
 wl_protos_src = []

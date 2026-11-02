@@ -8,7 +8,7 @@ branch `glassine/1.10.1` on top of upstream's tag. Releases are tagged
 |---|---|
 | `sway/glassine-epd-backend.c`, `sway/glassine-epd-output-proto.h` | the output backend that hands frames to the panel daemon ([GlassineOS/epd](https://github.com/GlassineOS/epd)) |
 | `sway/glassine-gesture.*`, `sway/glassine-popup-hint.*` | touch gestures, popup hints |
-| `sway/glassine-ink-area.c`, `protocols/glassine-ink-v1.xml` | the pen's ink areas |
+| `sway/glassine-ink-area.c`, `protocols/glassine-ink-v1.xml` | the pen's ink areas; also offered under the old name (`protocols/na1-ink-v1.xml`) for clients built before the rename, such as an installed Rnote Ink |
 | `wlroots/` | our wlroots 0.18.2 patches; `setup.sh` puts them in a subproject, linked statically |
 | `build-glassine.sh` | arm64 build on Alpine 3.24 |
 | `test/` | host tests, see `test/README.md` (not ported yet) |

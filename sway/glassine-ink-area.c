@@ -50,6 +50,7 @@
 #include "sway/tree/view.h"
 #include "glassine-ink-area.h"
 #include "glassine-ink-v1-protocol.h"
+#include "na1-ink-v1-protocol.h"
 #include "epd-brush.h"
 #ifndef M_PI                    /* -std=c11 */
 #define M_PI 3.14159265358979323846
@@ -338,6 +339,17 @@ static void brush_resource_destroy(struct wl_resource *res)
 	brush_unref(b);
 }
 
+/*
+ * Both protocol names share this code: their requests and events are the same, and
+ * only the interface tables differ. Children take the name their manager was bound
+ * under, as libwayland compares object arguments by interface name.
+ */
+static const struct wl_interface *child_iface(struct wl_resource *mgr,
+		const struct wl_interface *current, const struct wl_interface *old)
+{
+	return strcmp(wl_resource_get_class(mgr), na1_ink_manager_v1_interface.name) == 0 ? old : current;
+}
+
 static void mgr_create_brush(struct wl_client *c, struct wl_resource *res, uint32_t id)
 {
 	struct ink_brush *b = calloc(1, sizeof *b);
@@ -345,7 +357,8 @@ static void mgr_create_brush(struct wl_client *c, struct wl_resource *res, uint3
 		wl_client_post_no_memory(c);
 		return;
 	}
-	b->res = wl_resource_create(c, &glassine_ink_brush_v1_interface, wl_resource_get_version(res), id);
+	b->res = wl_resource_create(c, child_iface(res, &glassine_ink_brush_v1_interface, &na1_ink_brush_v1_interface),
+		wl_resource_get_version(res), id);
 	if (!b->res) {
 		free(b);
 		wl_client_post_no_memory(c);
@@ -567,7 +580,8 @@ static void mgr_get_ink_surface(struct wl_client *c, struct wl_resource *res, ui
 		wl_client_post_no_memory(c);
 		return;
 	}
-	i->res = wl_resource_create(c, &glassine_ink_surface_v1_interface, wl_resource_get_version(res), id);
+	i->res = wl_resource_create(c, child_iface(res, &glassine_ink_surface_v1_interface, &na1_ink_surface_v1_interface),
+		wl_resource_get_version(res), id);
 	if (!i->res) {
 		free(i);
 		wl_client_post_no_memory(c);
@@ -594,7 +608,8 @@ static const struct glassine_ink_manager_v1_interface mgr_impl = {
 
 static void mgr_bind(struct wl_client *c, void *data, uint32_t version, uint32_t id)
 {
-	struct wl_resource *res = wl_resource_create(c, &glassine_ink_manager_v1_interface, version, id);
+	const struct wl_interface *iface = data;
+	struct wl_resource *res = wl_resource_create(c, iface, version, id);
 	if (!res) {
 		wl_client_post_no_memory(c);
 		return;
@@ -663,7 +678,12 @@ void glassine_ink_init(struct wl_display *display)
 {
 	wl_list_init(&ink_surfs);
 	wl_list_init(&all_brushes);
-	wl_global_create(display, &glassine_ink_manager_v1_interface, 3, NULL, mgr_bind);     /* binds at the client's version (<= 3) */
+	/* binds at the client's version (<= 3) */
+	wl_global_create(display, &glassine_ink_manager_v1_interface, 3,
+		(void *)&glassine_ink_manager_v1_interface, mgr_bind);
+	/* the old name, for clients built before the rename (protocols/na1-ink-v1.xml) */
+	wl_global_create(display, &na1_ink_manager_v1_interface, 3,
+		(void *)&na1_ink_manager_v1_interface, mgr_bind);
 }
 struct walk { struct item it[MAXB]; int n; };
 
