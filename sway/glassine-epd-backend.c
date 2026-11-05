@@ -742,7 +742,7 @@ static bool output_set_cursor(struct wlr_output *wo, struct wlr_buffer *buf, int
     struct epd_output *o = wl_container_of(wo, o, base);
     struct epd_backend *be = o->be;
     if (be->cur.fd < 0) {
-        int fd = memfd_create("glassine-epd-cursor", MFD_CLOEXEC);
+        int fd = memfd_create("glassine-epd-cursor", MFD_CLOEXEC | MFD_ALLOW_SEALING);   /* (glassine-epdd-desktop seals it against shrinking, and refuses a file it cannot seal: never ftruncate it again) */
         void *m = fd < 0 || ftruncate(fd, 2 * GLASSINE_EPD_CUR_SLOT) ? MAP_FAILED :
                   mmap(NULL, 2 * GLASSINE_EPD_CUR_SLOT, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (m == MAP_FAILED) {
