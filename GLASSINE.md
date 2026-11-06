@@ -4,6 +4,10 @@ Sway 1.10.1 with the patches GlassineOS needs for its e-ink panel, as separate c
 branch `glassine/1.10.1` on top of upstream's tag. Releases are tagged
 `<ver>-glassine<N>`. Upstream's `README.md` still describes sway itself.
 
+Our additions are MIT, like sway (`LICENSE`), except `protocols/glassine-ink-v1.xml`, which
+is GPL-2.0-or-later like its main copy in
+[GlassineOS/protocols](https://github.com/GlassineOS/protocols).
+
 | Path | What |
 |---|---|
 | `sway/glassine-epd-backend.c`, `sway/glassine-epd-output-proto.h` | the output backend that hands frames to the panel daemon ([GlassineOS/epd](https://github.com/GlassineOS/epd)) |
