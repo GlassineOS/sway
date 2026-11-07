@@ -110,11 +110,18 @@ static void glassine_g_action(int fingers, int dir, char *act, size_t len) {
  * screen: through glassine-swayd (glassine_ga_full). false: not handled here */
 static bool glassine_g_full(struct sway_seat *seat, struct sway_container *con, const char *act, const char *what) {
 	char buf[128], path[108];
-	switch (glassine_ga_full(act, (unsigned long)con->node.id, container_has_mark(con, GLASSINE_GA_FULL_MARK),
+	bool marked = container_has_mark(con, GLASSINE_GA_FULL_MARK);
+	switch (glassine_ga_full(act, (unsigned long)con->node.id, marked,
 			con->pending.fullscreen_mode != FULLSCREEN_NONE, buf, sizeof buf)) {
 	case GLASSINE_GA_NOT_FULL_ACTION:
 		return false;
 	case GLASSINE_GA_SWAYD:
+		if (!marked && container_is_floating(con)) {
+			/* swayd's `full` looks only among the tiled windows and the ones it holds full
+			 * itself (marked): for any other floating one it logs "no window" and does nothing */
+			sway_log(SWAY_INFO, "glassine: %s (%s): a floating window can't be made full screen", what, act);
+			return true;
+		}
 		glassine_ga_swayd_path(path, sizeof path);
 		if (glassine_ga_send(path, buf) < 0) {
 			sway_log_errno(SWAY_ERROR, "glassine: %s (%s): glassine-swayd %s", what, act, path);
