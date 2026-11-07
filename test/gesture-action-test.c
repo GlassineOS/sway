@@ -1,7 +1,9 @@
 /* gesture-action-test.c — host test of sway/glassine-gesture-action.c: the
  * gestures file's ids (old and new), the defaults, and what each action sends,
  * glassine-swayd's socket faked by a datagram socket in a temporary
- * XDG_RUNTIME_DIR. Run by gesture-action-test.sh; argv[1]: an empty directory. */
+ * XDG_RUNTIME_DIR. Run by gesture-action-test.sh; argv[1]: an empty directory.
+ * Exit 0: passed; 1: a check failed; 2: the test could not run; 77: skipped (the
+ * socket path is over the sun_path limit). */
 #include "glassine-gesture-action.h"
 #include <errno.h>
 #include <stdio.h>
@@ -179,8 +181,10 @@ int main(int argc, char **argv) {
 	/* a fake glassine-swayd gets exactly the datagram */
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	if (strlen(path) >= sizeof a.sun_path) {
-		printf("skipped: socket path too long (%s)\n", path);
-		return 2;
+		/* a real skip: exit 77, and only when nothing before it failed */
+		printf("%d checks, %d failed; skipped the fake glassine-swayd checks: socket path too long (%s)\n",
+			checks, fails, path);
+		return fails ? 1 : 77;
 	}
 	strcpy(a.sun_path, path);
 	int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
