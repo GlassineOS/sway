@@ -9,7 +9,7 @@
  * cancelled (wl_touch.cancel), and every touch event until the last finger is
  * up is swallowed. A move of the fingers' centroid by swipe_px (layout
  * coordinates) fires the swipe once, by its main direction: left or right
- * (workspaces), up or down (maximize, minimize). cx, cy: where
+ * (screens), up or down (fullscreen, minimize). cx, cy: where
  * the gesture started (the centroid when the Nth finger landed): the window
  * it acts on. most: the fingers down at most before the swipe fired (3 or 4:
  * which set of actions; a finger that lands before the swipe restarts the

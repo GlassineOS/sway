@@ -33,6 +33,7 @@
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "sway/desktop/transaction.h"
 #include "glassine-gesture.h"
+#include "../glassine-gesture-action.h"
 
 /* Glassine : N-finger swipes on the touchscreen, in the compositor.
  * One finger or two go to the apps at once; the Nth finger turns the
@@ -40,20 +41,21 @@
  * sequence is swallowed, and a swipe runs an action.
  * GLASSINE_SWIPE_FINGERS (3; 0: off), GLASSINE_SWIPE_PX (125, layout px)
  * The actions come from $HOME/.config/glassine/gestures, which
- * glassine-settings > Gestures writes and this reads at each swipe (no reload):
- * lines "FINGERS DIRECTION ACTION", FINGERS 3 or 4 (a 4th finger before the
- * swipe makes it a 4-finger one), DIRECTION up/down/left/right; a missing
- * file or line: the defaults below. Window actions act on the window under
- * the fingers (where the gesture began; none there: nothing):
- * maximize the same as fullscreen (maximized and full screen were hard to tell apart in a tiling WM)
+ * glassine-settings > Gestures writes and this reads at each swipe (no reload);
+ * its format, the action ids, the defaults and the old ids still read:
+ * glassine-gesture-action.h. FINGERS 3 or 4 (a 4th finger before the swipe
+ * makes it a 4-finger one). Window actions act on the window under the
+ * fingers (where the gesture began; none there: nothing), except fullscreen
+ * and unfullscreen, which act on the focused window through glassine-swayd's
+ * `full` (the bar stays above it; never sway's fullscreen):
  * minimize a fullscreen window: back from fullscreen; a maximized one:
  * back to its tile; else to sway's scratchpad (glassine-shell
  * lists those in its workspaces popup and brings them back)
- * fullscreen, unfullscreen, close, swap (with the next tile),
+ * close, swap (with the next tile),
  * move-next, move-prev (to the next/previous workspace, and along)
  * page-up, page-down (that key to it: wtype)
- * the others: nothing, refresh (a full e-ink refresh), ws-next, ws-prev,
- * overview, launcher, quick, notices (glassine-shell's popups).
+ * the others: nothing, refresh (a full e-ink refresh), screen-next,
+ * screen-prev, home, overview, quick, notices (glassine-shell's requests).
  * Two-finger tap : a right click where the fingers were, for apps
  * whose menus only open on a mouse right click (sway has no long press =
  * right click as glassine-touchd on X had: a hold stays the apps'). The line
@@ -91,53 +93,56 @@ static bool glassine_g_on(void) {
 
 static const char *const glassine_g_dirs[4] = { "left", "right", "up", "down" };
 
-/* the action for a line "FINGERS WHAT ACTION" of the gestures file (dflt if none) */
-static void glassine_g_lookup(int fingers, const char *what, const char *dflt, char *act, size_t len) {
-	snprintf(act, len, "%s", dflt);
-	const char *home = getenv("HOME");
-	char path[512], line[256], d[16], a[64];
-	int n;
-	snprintf(path, sizeof path, "%s/.config/glassine/gestures", home ? home : "");
-	FILE *f = fopen(path, "r");
-	if (!f) {
-		return;
-	}
-	while (fgets(line, sizeof line, f)) {
-		if (sscanf(line, "%d %15s %63s", &n, d, a) == 3 && line[0] != '#'
-				&& n == fingers && !strcmp(d, what)) {
-			snprintf(act, len, "%s", a);
-		}
-	}
-	fclose(f);
+/* the action for "FINGERS WHAT" (glassine-gesture-action.h) */
+static void glassine_g_lookup(int fingers, const char *what, char *act, size_t len) {
+	char path[512];
+	glassine_ga_file(path, sizeof path);
+	glassine_ga_lookup(path, fingers, what, act, len);
 }
 
 /* the action for this many fingers and direction (index into glassine_g_dirs) */
 static void glassine_g_action(int fingers, int dir, char *act, size_t len) {
-	static const char *const dflt[2][4] = {
-		{ "ws-next", "ws-prev", "fullscreen", "minimize" },
-		{ "move-next", "move-prev", "overview", "refresh" },
-	};
-	glassine_g_lookup(fingers >= 4 ? 4 : 3, glassine_g_dirs[dir], dflt[fingers >= 4][dir], act, len);
+	glassine_g_lookup(fingers >= 4 ? 4 : 3, glassine_g_dirs[dir], act, len);
+}
+
+/* fullscreen/unfullscreen: the focused window, through glassine-swayd */
+static void glassine_g_full(struct sway_seat *seat, const char *act, const char *what) {
+	struct sway_container *con = seat_get_focused_container(seat);
+	if (!con || !con->view) {
+		sway_log(SWAY_DEBUG, "glassine: %s (%s): no focused window", what, act);
+		return;
+	}
+	char buf[128], path[108];
+	switch (glassine_ga_full(act, (unsigned long)con->node.id, container_has_mark(con, GLASSINE_GA_FULL_MARK),
+			con->pending.fullscreen_mode != FULLSCREEN_NONE, buf, sizeof buf)) {
+	case GLASSINE_GA_SWAYD:
+		glassine_ga_swayd_path(path, sizeof path);
+		if (glassine_ga_send(path, buf) < 0) {
+			sway_log_errno(SWAY_ERROR, "glassine: %s (%s): glassine-swayd %s", what, act, path);
+		} else {
+			sway_log(SWAY_DEBUG, "glassine: %s (%s): glassine-swayd %s", what, act, buf);
+		}
+		return;
+	case GLASSINE_GA_SWAY:;
+		sway_log(SWAY_DEBUG, "glassine: %s (%s): %s", what, act, buf);
+		struct sway_binding binding = { .type = BINDING_KEYSYM, .command = buf };
+		seat_execute_command(seat, &binding);
+		transaction_commit_dirty();
+		return;
+	default:
+		sway_log(SWAY_DEBUG, "glassine: %s (%s): already so", what, act);
+		return;
+	}
 }
 
 /* run ACT; window actions on the window at x, y. what: for the log */
 static void glassine_g_run(struct sway_seat *seat, const char *act, double x, double y, const char *what) {
-	static const struct { const char *act, *cmd; } global[] = {
-		{ "refresh", "exec /usr/bin/glassine-refresh" },
-		{ "ws-next", "workspace next_on_output" },
-		{ "ws-prev", "workspace prev_on_output" },
-		{ "overview", "exec /usr/bin/glassine-shell-wl toggle workspaces" },
-		{ "launcher", "exec /usr/bin/glassine-shell-wl toggle launcher" },
-		{ "quick", "exec /usr/bin/glassine-shell-wl toggle quick" },
-		{ "notices", "exec /usr/bin/glassine-shell-wl toggle notices" },
-	};
 	char buf[512], nbuf[128];
-	const char *cmd = NULL;
-	for (size_t i = 0; i < sizeof global / sizeof *global; i++) {
-		if (!strcmp(act, global[i].act)) {
-			cmd = global[i].cmd;
-		}
+	if (!strcmp(act, "fullscreen") || !strcmp(act, "unfullscreen")) {
+		glassine_g_full(seat, act, what);
+		return;
 	}
+	const char *cmd = glassine_ga_global(act);
 	if (!cmd && strcmp(act, "nothing")) {
 		struct wlr_surface *surface = NULL;
 		double sx, sy;
@@ -150,15 +155,9 @@ static void glassine_g_run(struct sway_seat *seat, const char *act, double x, do
 		bool full = con->pending.fullscreen_mode != FULLSCREEN_NONE;
 		bool max = container_has_mark(con, "glassine-max");
 		const char *c = NULL;
-		if (!strcmp(act, "maximize")) {
-			c = "fullscreen enable";
-			/* (was: a floating window filling the workspace, marked glassine-max; minimize still restores one) */
-		} else if (!strcmp(act, "minimize")) {
+		if (!strcmp(act, "minimize")) {
+			/* glassine-max: the old maximize (a floating window filling the workspace) */
 			c = full ? "fullscreen disable" : max ? "floating disable, unmark glassine-max" : "move scratchpad";
-		} else if (!strcmp(act, "fullscreen")) {
-			c = "fullscreen enable";
-		} else if (!strcmp(act, "unfullscreen")) {
-			c = "fullscreen disable";
 		} else if (!strcmp(act, "close")) {
 			c = "kill";
 		} else if (!strcmp(act, "move-next") || !strcmp(act, "move-prev")) {
@@ -296,7 +295,7 @@ static void glassine_g_cancel_ids(struct sway_cursor *cursor, struct wlr_touch *
 /* a two-finger tap: by default a right click at the tap */
 static void glassine_g_tap(struct sway_cursor *cursor, struct wlr_touch *touch, uint32_t time_msec) {
 	char act[64];
-	glassine_g_lookup(2, "tap", "right-click", act, sizeof act);
+	glassine_g_lookup(2, "tap", act, sizeof act);
 	if (!strcmp(act, "nothing")) {
 		for (int i = 0; i < gest.ntap; i++) {
 			glassine_g_up_to_apps(cursor, touch, time_msec, gest.tap_ids[i]);
