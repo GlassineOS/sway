@@ -48,8 +48,9 @@ enum glassine_ga_full {
 /* fullscreen/unfullscreen of window con_id, and minimize of one swayd holds
  * full screen (back from full, as minimize does for sway's fullscreen):
  * marked = it carries GLASSINE_GA_FULL_MARK, sway_full = in sway's own
- * fullscreen (an app asked for it; unfullscreen ends that, fullscreen turns it
- * into swayd's). Any other minimize: NOT_FULL_ACTION */
+ * fullscreen (an app asked for it; unfullscreen ends that, fullscreen leaves it
+ * as it is: swayd's `full` toggles that off, and it already shows as full
+ * screen). Any other minimize: NOT_FULL_ACTION */
 enum glassine_ga_full glassine_ga_full(const char *act, unsigned long con_id, int marked, int sway_full,
 	char *buf, size_t len);
 /* $XDG_RUNTIME_DIR/glassine-swayd (/tmp without it, as glassine-swayd does) */

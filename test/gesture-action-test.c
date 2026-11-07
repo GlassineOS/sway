@@ -136,7 +136,9 @@ int main(int argc, char **argv) {
 
 	/* fullscreen/unfullscreen: swayd's `full` (a toggle) only when it changes the window */
 	full("fullscreen", 0x2a, 0, 0, GLASSINE_GA_SWAYD, "full 2a");
-	full("fullscreen", 0x2a, 0, 1, GLASSINE_GA_SWAYD, "full 2a");
+	/* in sway's own fullscreen already: swayd's `full` would turn it off */
+	full("fullscreen", 0x2a, 0, 1, GLASSINE_GA_NOTHING, NULL);
+	full("fullscreen", 0x2a, 1, 1, GLASSINE_GA_NOTHING, NULL);
 	full("fullscreen", 0x2a, 1, 0, GLASSINE_GA_NOTHING, NULL);
 	full("unfullscreen", 0xabc, 1, 0, GLASSINE_GA_SWAYD, "full abc");
 	full("unfullscreen", 0xabc, 0, 0, GLASSINE_GA_NOTHING, NULL);

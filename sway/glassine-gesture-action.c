@@ -96,7 +96,13 @@ enum glassine_ga_full glassine_ga_full(const char *act, unsigned long con_id, in
 	if (!on && strcmp(act, "unfullscreen")) {
 		return GLASSINE_GA_NOT_FULL_ACTION;
 	}
-	/* swayd's `full W` toggles: sent only when it changes the window the way asked */
+	/* swayd's `full W` toggles, and it turns off a window in sway's own fullscreen
+	 * as well as a marked one. So it is sent only when that is what was asked: a
+	 * window in sway's fullscreen is already shown full screen (swayd treats both
+	 * kinds alike), and `fullscreen` on it does nothing */
+	if (on && sway_full && !marked) {
+		return GLASSINE_GA_NOTHING;
+	}
 	if (on ? !marked : marked) {
 		snprintf(buf, len, "full %lx", con_id);
 		return GLASSINE_GA_SWAYD;
