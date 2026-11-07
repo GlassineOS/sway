@@ -142,7 +142,11 @@ int main(int argc, char **argv) {
 	full("unfullscreen", 0xabc, 0, 0, GLASSINE_GA_NOTHING, NULL);
 	full("unfullscreen", 0xabc, 0, 1, GLASSINE_GA_SWAY, "[con_id=2748] fullscreen disable");
 	full("maximize", 1, 0, 0, GLASSINE_GA_NOT_FULL_ACTION, NULL);
+	/* minimize: a swayd-full window back from full (not hidden); any other is cursor.c's */
+	full("minimize", 0x5d, 1, 0, GLASSINE_GA_SWAYD, "full 5d");
+	full("minimize", 0x5d, 1, 1, GLASSINE_GA_SWAYD, "full 5d");
 	full("minimize", 1, 0, 0, GLASSINE_GA_NOT_FULL_ACTION, NULL);
+	full("minimize", 1, 0, 1, GLASSINE_GA_NOT_FULL_ACTION, NULL);
 	full("home", 1, 0, 0, GLASSINE_GA_NOT_FULL_ACTION, NULL);
 
 	/* the socket path */

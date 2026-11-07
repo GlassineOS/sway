@@ -86,6 +86,13 @@ const char *glassine_ga_global(const char *act) {
 enum glassine_ga_full glassine_ga_full(const char *act, unsigned long con_id, int marked, int sway_full,
 		char *buf, size_t len) {
 	int on = !strcmp(act, "fullscreen");
+	if (!strcmp(act, "minimize")) {
+		if (!marked) {
+			return GLASSINE_GA_NOT_FULL_ACTION;
+		}
+		on = 0;
+		act = "unfullscreen";
+	}
 	if (!on && strcmp(act, "unfullscreen")) {
 		return GLASSINE_GA_NOT_FULL_ACTION;
 	}

@@ -45,10 +45,11 @@
  * its format, the action ids, the defaults and the old ids still read:
  * glassine-gesture-action.h. FINGERS 3 or 4 (a 4th finger before the swipe
  * makes it a 4-finger one). Window actions act on the window under the
- * fingers (where the gesture began; none there: nothing), except fullscreen
- * and unfullscreen, which act on the focused window through glassine-swayd's
- * `full` (the bar stays above it; never sway's fullscreen):
- * minimize a fullscreen window: back from fullscreen; a maximized one:
+ * fingers (where the gesture began; none there: nothing):
+ * fullscreen, unfullscreen through glassine-swayd's `full` (the bar stays
+ * above the window; never sway's fullscreen)
+ * minimize a fullscreen window (glassine-swayd's or sway's): back from
+ * fullscreen; a maximized one:
  * back to its tile; else to sway's scratchpad (glassine-shell
  * lists those in its workspaces popup and brings them back)
  * close, swap (with the next tile),
@@ -105,16 +106,14 @@ static void glassine_g_action(int fingers, int dir, char *act, size_t len) {
 	glassine_g_lookup(fingers >= 4 ? 4 : 3, glassine_g_dirs[dir], act, len);
 }
 
-/* fullscreen/unfullscreen: the focused window, through glassine-swayd */
-static void glassine_g_full(struct sway_seat *seat, const char *act, const char *what) {
-	struct sway_container *con = seat_get_focused_container(seat);
-	if (!con || !con->view) {
-		sway_log(SWAY_DEBUG, "glassine: %s (%s): no focused window", what, act);
-		return;
-	}
+/* fullscreen, unfullscreen, and minimize of a window glassine-swayd holds full
+ * screen: through glassine-swayd (glassine_ga_full). false: not handled here */
+static bool glassine_g_full(struct sway_seat *seat, struct sway_container *con, const char *act, const char *what) {
 	char buf[128], path[108];
 	switch (glassine_ga_full(act, (unsigned long)con->node.id, container_has_mark(con, GLASSINE_GA_FULL_MARK),
 			con->pending.fullscreen_mode != FULLSCREEN_NONE, buf, sizeof buf)) {
+	case GLASSINE_GA_NOT_FULL_ACTION:
+		return false;
 	case GLASSINE_GA_SWAYD:
 		glassine_ga_swayd_path(path, sizeof path);
 		if (glassine_ga_send(path, buf) < 0) {
@@ -122,26 +121,22 @@ static void glassine_g_full(struct sway_seat *seat, const char *act, const char 
 		} else {
 			sway_log(SWAY_DEBUG, "glassine: %s (%s): glassine-swayd %s", what, act, buf);
 		}
-		return;
+		return true;
 	case GLASSINE_GA_SWAY:;
 		sway_log(SWAY_DEBUG, "glassine: %s (%s): %s", what, act, buf);
 		struct sway_binding binding = { .type = BINDING_KEYSYM, .command = buf };
 		seat_execute_command(seat, &binding);
 		transaction_commit_dirty();
-		return;
+		return true;
 	default:
 		sway_log(SWAY_DEBUG, "glassine: %s (%s): already so", what, act);
-		return;
+		return true;
 	}
 }
 
 /* run ACT; window actions on the window at x, y. what: for the log */
 static void glassine_g_run(struct sway_seat *seat, const char *act, double x, double y, const char *what) {
 	char buf[512], nbuf[128];
-	if (!strcmp(act, "fullscreen") || !strcmp(act, "unfullscreen")) {
-		glassine_g_full(seat, act, what);
-		return;
-	}
 	const char *cmd = glassine_ga_global(act);
 	if (!cmd && strcmp(act, "nothing")) {
 		struct wlr_surface *surface = NULL;
@@ -150,6 +145,9 @@ static void glassine_g_run(struct sway_seat *seat, const char *act, double x, do
 		struct sway_container *con = node && node->type == N_CONTAINER ? node->sway_container : NULL;
 		if (!con || !con->view) {
 			sway_log(SWAY_DEBUG, "glassine: %s (%s) at %.0f,%.0f: no window there", what, act, x, y);
+			return;
+		}
+		if (glassine_g_full(seat, con, act, what)) {
 			return;
 		}
 		bool full = con->pending.fullscreen_mode != FULLSCREEN_NONE;

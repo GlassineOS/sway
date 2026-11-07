@@ -12,9 +12,9 @@
  *   quick, notices    the shell's popups
  *   screen-next, screen-prev   the next/previous screen (sway workspace)
  *   refresh           a full e-ink refresh
- *   fullscreen, unfullscreen   the focused window full screen or back, through
- *                     glassine-swayd's `full` (the bar stays above it; never
- *                     sway's own fullscreen)
+ *   fullscreen, unfullscreen   the window under the fingers full screen or
+ *                     back, through glassine-swayd's `full` (the bar stays
+ *                     above it; never sway's own fullscreen)
  *   minimize, close, swap, move-next, move-prev, page-up, page-down
  *                     the window under the fingers
  *   nothing, right-click (2 tap only)
@@ -40,14 +40,16 @@ void glassine_ga_lookup(const char *path, int fingers, const char *what, char *a
 const char *glassine_ga_global(const char *act);
 
 enum glassine_ga_full {
-	GLASSINE_GA_NOT_FULL_ACTION, /* not fullscreen/unfullscreen */
+	GLASSINE_GA_NOT_FULL_ACTION, /* not handled here: the caller's own action */
 	GLASSINE_GA_NOTHING,         /* already as asked */
 	GLASSINE_GA_SWAYD,           /* send buf to glassine-swayd */
 	GLASSINE_GA_SWAY,            /* run buf as a sway command */
 };
-/* fullscreen/unfullscreen of window con_id: marked = it carries
- * GLASSINE_GA_FULL_MARK, sway_full = in sway's own fullscreen (an app asked
- * for it; unfullscreen ends that, fullscreen turns it into swayd's) */
+/* fullscreen/unfullscreen of window con_id, and minimize of one swayd holds
+ * full screen (back from full, as minimize does for sway's fullscreen):
+ * marked = it carries GLASSINE_GA_FULL_MARK, sway_full = in sway's own
+ * fullscreen (an app asked for it; unfullscreen ends that, fullscreen turns it
+ * into swayd's). Any other minimize: NOT_FULL_ACTION */
 enum glassine_ga_full glassine_ga_full(const char *act, unsigned long con_id, int marked, int sway_full,
 	char *buf, size_t len);
 /* $XDG_RUNTIME_DIR/glassine-swayd (/tmp without it, as glassine-swayd does) */
