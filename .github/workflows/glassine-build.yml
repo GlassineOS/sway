@@ -9,3 +9,4 @@ jobs:
       - uses: actions/checkout@v7
       - run: sh build-glassine.sh "$PWD/out"
       - run: sh test/gesture-action-test.sh
+      - run: sh test/shm-seal-test.sh

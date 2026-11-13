@@ -16,7 +16,7 @@ is GPL-2.0-or-later like its main copy in
 | `sway/glassine-ink-area.c`, `protocols/glassine-ink-v1.xml` | the pen's ink areas |
 | `wlroots/` | our wlroots 0.18.2 patches; `setup.sh` puts them in a subproject, linked statically |
 | `build-glassine.sh` | arm64 build on Alpine 3.24 |
-| `test/` | host tests, see `test/README.md` (`gesture-action-test.sh` runs; the rest not ported yet) |
+| `test/` | host tests, see `test/README.md` (`gesture-action-test.sh` and `shm-seal-test.sh` run; the rest not ported yet) |
 
 **Status:** not what devices run yet. Builds still come from the private development
 tree, which also still uses older runtime names. Those names change for both at the

@@ -14,3 +14,7 @@ defaults, and the request each action sends (glassine-swayd's socket faked in a 
 `XDG_RUNTIME_DIR`). The binary goes to `build-test/`, which git ignores; the fake socket's
 directory goes under `$TMPDIR` (`/tmp`), since a deep checkout's path would be over the 108-byte
 socket path limit. A `$TMPDIR` that is still too long makes the test exit 77: a skip, not a pass.
+
+`shm-seal-test.sh` runs too (curl, patch and a C compiler): it builds wlroots' `util/shm.c`
+with our patches and checks that the pixman renderer's buffers take `F_SEAL_SHRINK`, as the
+panel daemon requires, and that the backend's memfds (the cursor) allow sealing.
