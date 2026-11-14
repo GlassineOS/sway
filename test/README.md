@@ -14,3 +14,12 @@ defaults, and the request each action sends (glassine-swayd's socket faked in a 
 `XDG_RUNTIME_DIR`). The binary goes to `build-test/`, which git ignores; the fake socket's
 directory goes under `$TMPDIR` (`/tmp`), since a deep checkout's path would be over the 108-byte
 socket path limit. A `$TMPDIR` that is still too long makes the test exit 77: a skip, not a pass.
+
+`ink-popup-test.sh [SWAY]` runs too (Docker): it runs this sway headless in Alpine 3.24 with
+`ink-popup-client.c` (a window, a layer surface, input-method popups and a virtual pointer)
+and checks the ink lines sway writes to the panel daemon's FIFO: a popup's areas at its
+position, cut by what is above it and cutting what is below, following it when it moves and
+gone when it unmaps; a layer surface's areas; and that the pointer's press and drag reach
+the popup without moving focus. SWAY: a `build-glassine.sh` binary for the host's
+architecture (as in CI); without it the container builds this tree. Logs go to
+`build-test/ink-popup/`.
