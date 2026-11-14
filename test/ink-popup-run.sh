@@ -10,8 +10,8 @@
 #  4  a second popup above it, with an ink object but no areas: emits nothing,
 #     cuts the first
 #  5  the cursor moves: the popup's rect moves with it
-#  6  unmap / map / destroy: its rect goes and comes back, the window gets its
-#     region back
+#  6  text input off / unmap / map / destroy: its rect goes and comes back,
+#     the window gets its region back
 #  7  a layer surface (bottom edge) with an ink area: APP = its namespace,
 #     cuts the window
 #  8  a popup for a text field on the layer surface (flipped above the
@@ -160,7 +160,14 @@ send "cur 100 150"
 send "show 0"
 expect_line "^ink r [0-9]* 1 200 340 320 160 input-method\$" "5 the rect follows the popup"
 expect ink-test 208000 "5 the window's hole moves too"
-# 6
+# 6: the field loses the text input with the popup still mapped
+send "tioff"
+wait_log "^im-deactivate"
+expect input-method 0 "6 text input off: no rect"
+expect ink-test 240000 "6 text input off: the window's region is whole again"
+send "ti 100 150"
+send "show 0"
+expect input-method 51200 "6 text input on again: the rect is back"
 send "hide 0"
 expect input-method 0 "6 unmapped: no rect"
 expect ink-test 240000 "6 unmapped: the window's region is whole again"
