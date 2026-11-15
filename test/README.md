@@ -15,12 +15,6 @@ defaults, and the request each action sends (glassine-swayd's socket faked in a 
 directory goes under `$TMPDIR` (`/tmp`), since a deep checkout's path would be over the 108-byte
 socket path limit. A `$TMPDIR` that is still too long makes the test exit 77: a skip, not a pass.
 
-`palm-window-test.sh` runs with the host's C compiler too: it checks
-`sway/glassine-palm-window.c`, the window that holds a touch beside the writing paper
-before it counts as a palm (the pen came), a tap (it lifted) or a finger (still down when
-the window ends). Touch can't be injected into a headless sway, so the glue in
-`sway/input/cursor.c` is not covered.
-
 `ink-popup-test.sh [SWAY]` runs too (Docker): it runs this sway headless in Alpine 3.24 with
 `ink-popup-client.c` (a window, a layer surface, input-method popups and a virtual pointer)
 and checks the ink lines sway writes to the panel daemon's FIFO: a popup's areas at its
