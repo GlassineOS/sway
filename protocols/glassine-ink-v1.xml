@@ -19,6 +19,12 @@
     <request name="get_ink_surface">
       <description summary="ink areas for a surface">
         At most one per wl_surface (a second one is a protocol error).
+        Areas count on a window's surfaces, on input method popup surfaces
+        (zwp_input_popup_surface_v2, such as an on-screen keyboard's
+        handwriting field) and on layer-shell surfaces, each with its
+        subsurfaces. A popup or layer surface has no per-app default: it inks
+        only inside areas it set. On other surfaces (menus) areas have no
+        effect.
       </description>
       <arg name="id" type="new_id" interface="glassine_ink_surface_v1"/>
       <arg name="surface" type="object" interface="wl_surface"/>
