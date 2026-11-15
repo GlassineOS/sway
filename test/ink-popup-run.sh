@@ -18,6 +18,10 @@
 #  8  a popup for a text field on the layer surface (centred on the output,
 #     flipped above the cursor, no room below); a click on it keeps the
 #     layer's focus
+#  9  a text field without a cursor rectangle (Chromium), its window shrunk
+#     by a keyboard-like layer's exclusive zone: the popup lies
+#     over the window's top; the zone goes (the window grows), the popup
+#     commits (ink): it stays where it was, and the next press reaches it
 set -eu
 apk add -q build-base meson ninja pkgconf basu-dev cairo-dev eudev-dev gdk-pixbuf-dev json-c-dev libevdev-dev \
     libinput-dev libxkbcommon-dev linux-pam-dev pango-dev pcre2-dev wayland-dev wayland-protocols curl \
@@ -124,6 +128,20 @@ expect_line() {
 expect_log() {
     if grep -q -- "$1" /out/client.log; then echo "ok: $2"; else echo "FAIL: $2: the client got no '$1'"; FAIL=1; fi
 }
+# lines the client printed since mark
+mark() { MARK=$(wc -l </out/client.log); }
+wait_new() {
+    i=0
+    while ! tail -n +$((MARK + 1)) /out/client.log | grep -q -- "$1"; do
+        i=$((i + 1))
+        if [ $i -gt 50 ]; then echo "FAIL: no new '$1' from the client"; FAIL=1; tail -5 /out/client.log; finish; fi
+        sleep 0.1
+    done
+}
+# APP's first rect in the last block: "X Y W H" (panel px)
+rect() {
+    block | awk -v app="$1" '$1 == "ink" && $2 == "r" && $9 == app { print $5, $6, $7, $8; exit }'
+}
 expect_no_log() {
     if grep -q -- "$1" /out/client.log; then echo "FAIL: $2: the client got '$1'"; FAIL=1; else echo "ok: $2"; fi
 }
@@ -205,4 +223,36 @@ wait_log "^ptr-button popup2 up"
 expect_log "^ptr-button popup2 down" "8 the press reaches the popup"
 expect_no_log "^ti-leave layer" "8 a click on the popup keeps the layer's focus"
 expect input-method 51200 "8 the popup stays"
+# 9: the window shrinks to 400x200 (a keyboard-like layer, zone 100), a field without
+# a cursor rectangle gets the focus; the popup 160x80 lies over the window's
+# top, centred: 120,0 = panel 240,0 320x160
+send "kill 2"
+send "tioff"
+mark
+send "unlayer"
+wait_new "^ti-enter win"
+send "osk 100"
+wait_new "^win-size 400x200"
+mark
+send "tinr"
+wait_new "^im-activate"
+send "popup 3 160 80 1"
+expect_line "^ink r [0-9]* 1 240 0 320 160 input-method\$" "9 no cursor rectangle: over the window's top"
+R9=$(rect input-method)
+mark
+send "unosk"
+wait_new "^win-size 400x300"
+send "show 3"
+expect_line "^ink r [0-9]* 1 240 0 320 160 input-method\$" "9 the window grew, the popup committed: it stays"
+[ "$(rect input-method)" = "$R9" ] || { echo "FAIL: 9 moved: $R9 -> $(rect input-method)"; FAIL=1; }
+# the pen where the popup was first put (a quarter down into it)
+set -- $R9
+mark
+send "ptr $((($1 + $3 / 2) / 2)) $((($2 + $4 / 4) / 2))"
+wait_new "^ptr-enter "
+send "down"
+send "up"
+wait_new "^ptr-button popup3 up"
+if tail -n +$((MARK + 1)) /out/client.log | grep -q "^ptr-button popup3 down"; then echo "ok: 9 the next press reaches the popup"; else echo "FAIL: 9 the next press missed the popup"; FAIL=1; fi
+if tail -n +$((MARK + 1)) /out/client.log | grep -q "^ti-leave\|^im-deactivate"; then echo "FAIL: 9 the field lost the focus"; FAIL=1; else echo "ok: 9 the field keeps the focus"; fi
 finish

@@ -7,7 +7,12 @@
  *                      ink area: the left half of its first size
  *   layer H            a layer surface (top layer, bottom edge, namespace
  *                      ink-test-layer, keyboard on demand), ink area: all of it
+ *   unlayer            destroy the layer surface
+ *   osk H              a keyboard-like layer surface (bottom edge, exclusive
+ *                      zone H, no keyboard focus, no ink): the window shrinks
+ *   unosk              destroy it (the window grows back)
  *   ti X Y             enable the text input on the entered surface, cursor X Y 2x20
+ *   tinr               enable it without a cursor rectangle (as Chromium)
  *   cur X Y            move the cursor rectangle (the popups follow at their next commit)
  *   tioff              disable it
  *   popup N W H A      input-method popup N (0..3) of WxH; A 1: ink area all of
@@ -16,7 +21,7 @@
  *   kill N             destroy popup N
  *   ptr X Y            pointer to layout X Y (extent: the output's layout size)
  *   down / up          left button
- * It prints what it gets: ti-enter/ti-leave, im-activate/im-deactivate,
+ * It prints what it gets: win-size WxH (a new size), ti-enter/ti-leave, im-activate/im-deactivate,
  * ptr-enter/ptr-leave/ptr-button/ptr-motion with the surface's name, and
  * "ok" after each command once the compositor has seen it (a roundtrip). */
 #define _GNU_SOURCE
@@ -118,6 +123,7 @@ static void xs_configure(void *d, struct xdg_surface *xs, uint32_t serial)
 		win_bh = win_h;
 		wl_surface_attach(win_s, buffer(win_w, win_h), 0, 0);
 		wl_surface_commit(win_s);
+		printf("win-size %dx%d\n", win_w, win_h);
 	}
 }
 static const struct xdg_surface_listener xs_l = { .configure = xs_configure };
@@ -143,6 +149,18 @@ static void ls_configure(void *d, struct zwlr_layer_surface_v1 *l, uint32_t seri
 }
 static void ls_closed(void *d, struct zwlr_layer_surface_v1 *l) {}
 static const struct zwlr_layer_surface_v1_listener ls_l = { .configure = ls_configure, .closed = ls_closed };
+
+static struct wl_surface *osk_s;
+static struct zwlr_layer_surface_v1 *osk_ls;
+static int osk_w, osk_h, osk_cfg;
+static void osk_configure(void *d, struct zwlr_layer_surface_v1 *l, uint32_t serial, uint32_t w, uint32_t h)
+{
+	zwlr_layer_surface_v1_ack_configure(l, serial);
+	osk_w = w;
+	osk_h = h;
+	osk_cfg = 1;
+}
+static const struct zwlr_layer_surface_v1_listener osk_l = { .configure = osk_configure, .closed = ls_closed };
 
 static void ti_enter(void *d, struct zwp_text_input_v3 *t, struct wl_surface *s)
 {
@@ -302,6 +320,34 @@ static void command(char *l)
 		wl_surface_attach(layer_s, buffer(layer_w, layer_h), 0, 0);
 		wl_surface_commit(layer_s);
 		printf("layer %dx%d\n", layer_w, layer_h);
+	} else if (sscanf(l, "osk %d", &a) == 1 && !osk_ls) {
+		osk_s = wl_compositor_create_surface(comp);
+		osk_ls = zwlr_layer_shell_v1_get_layer_surface(lsh, osk_s, out, ZWLR_LAYER_SHELL_V1_LAYER_TOP, "ink-test-osk");
+		zwlr_layer_surface_v1_add_listener(osk_ls, &osk_l, NULL);
+		zwlr_layer_surface_v1_set_anchor(osk_ls, ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+			ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+		zwlr_layer_surface_v1_set_size(osk_ls, 0, a);
+		zwlr_layer_surface_v1_set_exclusive_zone(osk_ls, a);
+		wl_surface_commit(osk_s);
+		wait_for(&osk_cfg);
+		wl_surface_attach(osk_s, buffer(osk_w, osk_h), 0, 0);
+		wl_surface_commit(osk_s);
+	} else if (!strcmp(l, "unlayer") && layer_ls) {
+		zwlr_layer_surface_v1_destroy(layer_ls);
+		wl_surface_destroy(layer_s);
+		layer_ls = NULL;
+		layer_s = NULL;
+	} else if (!strcmp(l, "unosk") && osk_ls) {
+		zwlr_layer_surface_v1_destroy(osk_ls);
+		wl_surface_destroy(osk_s);
+		osk_ls = NULL;
+		osk_s = NULL;
+		osk_cfg = 0;
+	} else if (!strcmp(l, "tinr")) {
+		zwp_text_input_v3_enable(ti);
+		zwp_text_input_v3_set_content_type(ti, ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
+			ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+		zwp_text_input_v3_commit(ti);
 	} else if (sscanf(l, "ti %d %d", &a, &b) == 2) {
 		zwp_text_input_v3_enable(ti);
 		zwp_text_input_v3_set_content_type(ti, ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
