@@ -9,13 +9,15 @@
 #     press, drag, release reach the popup; the text field keeps its focus
 #  4  a second popup above it, with an ink object but no areas: emits nothing,
 #     cuts the first
-#  5  the cursor moves: the popup's rect moves with it
+#  5  the cursor moves to another line: the popup moves down with it but
+#     keeps its x (centred on the window)
 #  6  text input off / unmap / map / destroy: its rect goes and comes back,
 #     the window gets its region back
 #  7  a layer surface (bottom edge) with an ink area: APP = its namespace,
 #     cuts the window
-#  8  a popup for a text field on the layer surface (flipped above the
-#     cursor, no room below); a click on it keeps the layer's focus
+#  8  a popup for a text field on the layer surface (centred on the output,
+#     flipped above the cursor, no room below); a click on it keeps the
+#     layer's focus
 set -eu
 apk add -q build-base meson ninja pkgconf basu-dev cairo-dev eudev-dev gdk-pixbuf-dev json-c-dev libevdev-dev \
     libinput-dev libxkbcommon-dev linux-pam-dev pango-dev pcre2-dev wayland-dev wayland-protocols curl \
@@ -132,34 +134,35 @@ send "win 400 300"
 wait_log "^ti-enter win"
 expect ink-test 240000 "1 window's ink area"
 expect_line "^ink r [0-9]* 1 0 0 400 600 ink-test\$" "1 window's rect with its brush, S 1"
-# 2: cursor 20,40 2x20 -> popup 160x80 at 20,60 = panel 40,120 320x160
+# 2: cursor 20,40 2x20 -> popup 160x80 centred on the 400 wide window, below
+# the cursor: 120,60 = panel 240,120 320x160; it covers 80x80 of the ink area
 send "ti 20 40"
 wait_log "^im-activate"
 send "popup 0 160 80 1"
 expect input-method 51200 "2 popup's ink area"
-expect_line "^ink r [0-9]* 1 40 120 320 160 input-method\$" "2 popup's rect, S 1, with a brush, at the popup"
-expect ink-test 188800 "2 the popup cuts the window"
+expect_line "^ink r [0-9]* 1 240 120 320 160 input-method\$" "2 popup's rect, S 1, with a brush, at the popup"
+expect ink-test 214400 "2 the popup cuts the window"
 # 3: the pointer on the popup (popup-local 80,40), a drag, a release
-send "ptr 100 100"
+send "ptr 200 100"
 wait_log "^ptr-enter popup0 80 40"
 send "down"
-send "ptr 120 110"
+send "ptr 220 110"
 send "up"
 wait_log "^ptr-button popup0 up"
 expect_log "^ptr-button popup0 down" "3 the press reaches the popup"
 expect_log "^ptr-motion popup0 100 50" "3 the drag reaches the popup"
 expect_no_log "^ti-leave" "3 the text field keeps the focus"
 expect input-method 51200 "3 the popup stays"
-# 4: a second popup above, 60x30 at the same place, no areas
+# 4: a second popup above, 60x30 (centred: 170,60, inside the first), no areas
 send "popup 1 60 30 0"
 expect input-method 44000 "4 a popup above cuts the first; one without areas adds none"
 send "kill 1"
 expect input-method 51200 "4 back when it goes"
-# 5: cursor to 100,150: popup at 100,170 = panel 200,340
+# 5: cursor to 100,150: popup at 120,170 = panel 240,340 (same x as before)
 send "cur 100 150"
 send "show 0"
-expect_line "^ink r [0-9]* 1 200 340 320 160 input-method\$" "5 the rect follows the popup"
-expect ink-test 208000 "5 the window's hole moves too"
+expect_line "^ink r [0-9]* 1 240 340 320 160 input-method\$" "5 the rect follows the cursor's line, not its x"
+expect ink-test 214400 "5 the window's hole moves too"
 # 6: the field loses the text input with the popup still mapped
 send "tioff"
 wait_log "^im-deactivate"
@@ -182,7 +185,8 @@ send "layer 100"
 expect ink-test-layer 160000 "7 layer surface's ink area (APP = its namespace)"
 expect ink-test 160000 "7 the layer surface cuts the window"
 # 8: focus the layer (on demand: a click), a text field at 10,10 on it:
-# no room below (y 230 + 80 > 300) -> the popup goes above: 10,130
+# no room below (y 230 + 80 > 300) -> the popup goes above, centred on the
+# output: 120,130
 send "ptr 50 250"
 send "down"
 send "up"
@@ -190,10 +194,10 @@ wait_log "^ti-enter layer"
 send "ti 10 10"
 send "popup 2 160 80 1"
 expect input-method 51200 "8 popup over a layer surface"
-expect_line "^ink r [0-9]* 1 20 260 320 160 input-method\$" "8 its rect, above the cursor"
+expect_line "^ink r [0-9]* 1 240 260 320 160 input-method\$" "8 its rect, above the cursor"
 expect ink-test-layer 153600 "8 the popup cuts the layer surface"
-expect ink-test 115200 "8 and the window"
-send "ptr 50 150"
+expect ink-test 137600 "8 and the window"
+send "ptr 160 150"
 wait_log "^ptr-enter popup2 40 20"
 send "down"
 send "up"
