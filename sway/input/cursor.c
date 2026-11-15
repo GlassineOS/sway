@@ -34,6 +34,7 @@
 #include "sway/desktop/transaction.h"
 #include "glassine-gesture.h"
 #include "../glassine-gesture-action.h"
+#include "../glassine-palm-window.h"
 
 /* Glassine : N-finger swipes on the touchscreen, in the compositor.
  * One finger or two go to the apps at once; the Nth finger turns the
@@ -229,6 +230,8 @@ static void glassine_g_command(struct sway_seat *seat, enum glassine_g_result r)
 }
 
 static void handle_touch_cancel(struct wl_listener *listener, void *data);
+static void handle_touch_down(struct wl_listener *listener, void *data);
+static void handle_touch_motion(struct wl_listener *listener, void *data);
 static void handle_touch_up(struct wl_listener *listener, void *data);
 static void handle_touch_frame(struct wl_listener *listener, void *data);
 
@@ -446,16 +449,89 @@ static bool penblock_swallow(int32_t id, bool down, bool up) {
 /*
  * Glassine: while a writing surface is up (the on-screen keyboard's
  * handwriting paper: an input-method popup with ink areas), a touch that
- * lands outside the input method's own surfaces (the paper, its keys) is the
- * writing hand. The hand rests on the app below the paper and lands before
+ * lands outside the input method's own surfaces (the paper, its keys) may be
+ * the writing hand. The hand rests on the app below the paper and lands before
  * the pen comes into range, and again between words; as a tap it blurred the
- * text field, which closed the paper. Such a touch is held like a palm under
- * a pen in range: it reaches no app, moves no focus and starts no gesture,
- * until it lifts. A finger still taps the paper's controls and the keys; the
- * pen still reaches anything. Off with pen palm rejection (/etc/glassine/pen-palm).
+ * text field, which closed the paper. Such a touch is held for PAPERWIN_MS
+ * (glassine-palm-window.h), its motion queued:
+ *  - the pen comes into range or touches while it is held: a palm, held like
+ *    one under a pen in range until it lifts (no app, no focus, no gesture);
+ *  - it lifts first: a tap, its down and motion go out with the up;
+ *  - it is still down when the window ends: a finger, its down and motion go
+ *    out then, the rest live.
+ * A touch already delivered when the pen comes is cancelled as above. A finger
+ * on the paper's controls and the keys, and the pen, are never held. Off with
+ * pen palm rejection (/etc/glassine/pen-palm).
  */
-static bool paperblock_holds(struct sway_seat *seat, int32_t id, double lx, double ly) {
-	if (!penblock_on() || !sway_input_method_relay_writing_up(&seat->im_relay)) {
+#define PAPERWIN_MS 300
+static struct glassine_palm_window paperwin;
+static struct wl_event_source *paperwin_timer;
+static struct wlr_touch *paperwin_touch;
+static bool paperwin_replay; /* our own replayed down: not held again */
+
+static void paperwin_timer_update(void) {
+	if (paperwin_timer) {
+		wl_event_source_timer_update(paperwin_timer,
+			glassine_pw_next_ms(&paperwin, get_current_time_msec()));
+	}
+}
+
+/* a held touch's events, to the session as they came (each with its frame) */
+static void paperwin_deliver(struct sway_cursor *cursor, int32_t id,
+		const struct glassine_pw_ev *ev, int n) {
+	paperwin_replay = true;
+	for (int i = 0; i < n && paperwin_touch; i++) {
+		if (ev[i].kind == GLASSINE_PW_DOWN) {
+			struct wlr_touch_down_event e = {
+				.touch = paperwin_touch, .time_msec = ev[i].time_msec,
+				.touch_id = id, .x = ev[i].x, .y = ev[i].y,
+			};
+			handle_touch_down(&cursor->touch_down, &e);
+		} else {
+			struct wlr_touch_motion_event e = {
+				.touch = paperwin_touch, .time_msec = ev[i].time_msec,
+				.touch_id = id, .x = ev[i].x, .y = ev[i].y,
+			};
+			handle_touch_motion(&cursor->touch_motion, &e);
+		}
+		handle_touch_frame(&cursor->touch_frame, NULL);
+	}
+	paperwin_replay = false;
+}
+
+/* windows that ended: fingers */
+static int paperwin_timer_fired(void *data) {
+	struct sway_cursor *cursor = data;
+	struct glassine_pw_ev ev[GLASSINE_PW_EVMAX];
+	int32_t id;
+	int n;
+	while ((n = glassine_pw_take_due(&paperwin, get_current_time_msec(), &id, ev)) >= 0) {
+		sway_log(SWAY_DEBUG, "glassine: touch %d is a finger, delivered", id);
+		paperwin_deliver(cursor, id, ev, n);
+	}
+	paperwin_timer_update();
+	return 0;
+}
+
+/* the pen came: the held touches are palms, swallowed until they lift */
+static void paperwin_pen(void) {
+	int32_t ids[GLASSINE_PW_MAX];
+	int n = glassine_pw_pen(&paperwin, ids, GLASSINE_PW_MAX);
+	for (int i = 0; i < n; i++) {
+		penblock_add(penblock_held, &penblock_nheld, ids[i]);
+	}
+	if (n) {
+		sway_log(SWAY_DEBUG, "glassine: pen came, %d held touch(es) dropped as palms", n);
+		paperwin_timer_update();
+	}
+}
+
+/* a new touch: hold it in the window? */
+static bool paperwin_holds(struct sway_cursor *cursor, struct wlr_touch_down_event *event,
+		double lx, double ly) {
+	struct sway_seat *seat = cursor->seat;
+	if (paperwin_replay || !penblock_on() ||
+			!sway_input_method_relay_writing_up(&seat->im_relay)) {
 		return false;
 	}
 	struct wlr_surface *surface = NULL;
@@ -464,13 +540,28 @@ static bool paperblock_holds(struct sway_seat *seat, int32_t id, double lx, doub
 	if (sway_input_method_relay_owns_surface(&seat->im_relay, surface)) {
 		return false;
 	}
-	penblock_add(penblock_held, &penblock_nheld, id);
-	sway_log(SWAY_DEBUG, "glassine: touch %d ignored, the writing paper is up", id);
+	if (!paperwin.ms) {
+		glassine_pw_init(&paperwin, PAPERWIN_MS);
+	}
+	if (!glassine_pw_hold(&paperwin, event->touch_id, get_current_time_msec(),
+			event->time_msec, event->x, event->y)) {
+		return false;
+	}
+	if (!paperwin_timer) {
+		paperwin_timer = wl_event_loop_add_timer(server.wl_event_loop,
+			paperwin_timer_fired, cursor);
+	}
+	paperwin_touch = event->touch;
+	/* not the session's until it is delivered (a pen now must not cancel it) */
+	penblock_del(penblock_down, &penblock_ndown, event->touch_id);
+	paperwin_timer_update();
+	sway_log(SWAY_DEBUG, "glassine: touch %d held, the writing paper is up", event->touch_id);
 	return true;
 }
 
 static void penblock_tool_event(void) {
 	penblock_last = get_current_time_msec();
+	paperwin_pen();
 }
 
 /* the pen came into range: cancel the session's touches, hold them to the lift */
@@ -912,7 +1003,7 @@ static void handle_touch_down(struct wl_listener *listener, void *data) {
 	wlr_cursor_absolute_to_layout_coords(cursor->cursor, &event->touch->base,
 			event->x, event->y, &lx, &ly);
 
-	if (paperblock_holds(seat, event->touch_id, lx, ly)) {
+	if (paperwin_holds(cursor, event, lx, ly)) {
 		return;
 	}
 
@@ -941,6 +1032,14 @@ static void handle_touch_up(struct wl_listener *listener, void *data) {
 	struct sway_cursor *cursor = wl_container_of(listener, cursor, touch_up);
 	struct wlr_touch_up_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
+	struct glassine_pw_ev held[GLASSINE_PW_EVMAX];
+	int nheld = glassine_pw_up(&paperwin, event->touch_id, held);
+	if (nheld >= 0) {
+		/* a tap: its down and motion first (then the up as any other) */
+		sway_log(SWAY_DEBUG, "glassine: touch %d is a tap, delivered", event->touch_id);
+		paperwin_timer_update();
+		paperwin_deliver(cursor, event->touch_id, held, nheld);
+	}
 	if (penblock_swallow(event->touch_id, false, true)) {
 		return;
 	}
@@ -978,6 +1077,10 @@ static void handle_touch_cancel(struct wl_listener *listener, void *data) {
 	if (penblock_swallow(event->touch_id, false, true)) {
 		return;
 	}
+	if (glassine_pw_cancel(&paperwin, event->touch_id)) {
+		paperwin_timer_update();
+		return;
+	}
 
 	struct sway_seat *seat = cursor->seat;
 
@@ -1008,6 +1111,9 @@ static void handle_touch_motion(struct wl_listener *listener, void *data) {
 	struct wlr_touch_motion_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
 	if (penblock_swallow(event->touch_id, false, false)) {
+		return;
+	}
+	if (glassine_pw_motion(&paperwin, event->touch_id, event->time_msec, event->x, event->y)) {
 		return;
 	}
 
