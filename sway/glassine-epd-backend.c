@@ -3,8 +3,8 @@
  *
  * One output, EPD-1 (portrait 1404x1872; GLASSINE_EPD_SIZE=WxH for host tests).
  * Buffer caps: SHM and DMABUF. With the pixman renderer sway's allocator makes
- * memfd buffers; with GLES (WLR_RENDERER=gles2) GBM buffers on the
- * render node, LINEAR XRGB8888/ARGB8888 only (the primary formats), which go to
+ * memfd buffers that allow sealing (our wlroots 0009; the daemon seals them);
+ * with GLES (WLR_RENDERER=gles2) GBM buffers on the render node, LINEAR XRGB8888/ARGB8888 only (the primary formats), which go to
  * glassine-epdd-desktop as DMABUF and are read on its GPU. Per commit:
  * - a buffer not yet known to glassine-epdd-desktop: BUF + its fd (once);
  * - FRAME with the commit's damage (buffer coordinates);
@@ -742,7 +742,7 @@ static bool output_set_cursor(struct wlr_output *wo, struct wlr_buffer *buf, int
     struct epd_output *o = wl_container_of(wo, o, base);
     struct epd_backend *be = o->be;
     if (be->cur.fd < 0) {
-        int fd = memfd_create("glassine-epd-cursor", MFD_CLOEXEC);
+        int fd = memfd_create("glassine-epd-cursor", MFD_CLOEXEC | MFD_ALLOW_SEALING);
         void *m = fd < 0 || ftruncate(fd, 2 * GLASSINE_EPD_CUR_SLOT) ? MAP_FAILED :
                   mmap(NULL, 2 * GLASSINE_EPD_CUR_SLOT, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (m == MAP_FAILED) {

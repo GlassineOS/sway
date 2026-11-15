@@ -10,3 +10,4 @@ jobs:
       - run: sh build-glassine.sh "$PWD/out"
       - run: sh test/gesture-action-test.sh
       - run: sh test/ink-popup-test.sh "$PWD/out/sway-glassine"
+      - run: sh test/shm-seal-test.sh
