@@ -10,6 +10,7 @@
 #include "sway/input/text_input_popup.h"
 #include "sway/layers.h"
 #include "sway/server.h"
+#include "../glassine-ink-area.h"
 
 static struct sway_text_input *relay_get_focusable_text_input(
 		struct sway_input_method_relay *relay) {
@@ -124,6 +125,25 @@ static void handle_im_destroy(struct wl_listener *listener, void *data) {
 			text_input->input->focused_surface);
 		wlr_text_input_v3_send_leave(text_input->input);
 	}
+}
+
+bool sway_input_method_relay_writing_up(struct sway_input_method_relay *relay) {
+	struct sway_input_popup *popup;
+	wl_list_for_each(popup, &relay->input_popups, link) {
+		struct wlr_surface *s = popup->popup_surface->surface;
+		if (popup->scene_tree && popup->scene_tree->node.enabled && s->mapped &&
+				glassine_ink_has_areas(s)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool sway_input_method_relay_owns_surface(struct sway_input_method_relay *relay,
+		struct wlr_surface *surface) {
+	return relay->input_method && surface &&
+		wl_resource_get_client(surface->resource) ==
+		wl_resource_get_client(relay->input_method->resource);
 }
 
 static void constrain_popup(struct sway_input_popup *popup) {
