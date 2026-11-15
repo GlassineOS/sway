@@ -19,5 +19,12 @@ struct sway_input_popup {
 	struct wl_listener popup_surface_unmap;
 
 	struct wl_listener focused_surface_unmap;
+
+	// Glassine: the text field's surface commits (its window resized or
+	// moved): the popup is placed again at once, not at its own next commit
+	struct wl_listener focused_surface_commit;
+	// Glassine: the text input rectangle last sent (sent again only changed)
+	struct wlr_box sent_rect;
+	bool rect_sent;
 };
 #endif
