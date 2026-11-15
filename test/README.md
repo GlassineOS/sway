@@ -23,3 +23,7 @@ gone when it unmaps; a layer surface's areas; and that the pointer's press and d
 the popup without moving focus. SWAY: a `build-glassine.sh` binary for the host's
 architecture (as in CI); without it the container builds this tree. Logs go to
 `build-test/ink-popup/`.
+
+`shm-seal-test.sh` runs too (curl, patch and a C compiler): it builds wlroots' `util/shm.c`
+with our patches and checks that the pixman renderer's buffers take `F_SEAL_SHRINK`, as the
+panel daemon requires, and that the backend's memfds (the cursor) allow sealing.
