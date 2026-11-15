@@ -137,6 +137,12 @@ static struct ink_surf *ink_surf_for(struct wlr_surface *s)
 	return NULL;
 }
 
+bool glassine_ink_has_areas(struct wlr_surface *s)
+{
+	struct ink_surf *i = s ? ink_surf_for(s) : NULL;
+	return i && i->set && pixman_region32_not_empty(&i->areas);
+}
+
 static void brush_unuse(struct ink_brush *b);
 
 static void ink_surf_free(struct ink_surf *i)
