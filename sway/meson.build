@@ -31,7 +31,6 @@ sway_sources = files(
 	'input/cursor.c',
 	'glassine-gesture.c',
 	'glassine-gesture-action.c',
-	'glassine-palm-window.c',
 	'input/keyboard.c',
 	'input/seat.c',
 	'input/seatop_default.c',
