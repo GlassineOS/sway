@@ -130,7 +130,7 @@ static void constrain_popup(struct sway_input_popup *popup) {
 	struct sway_text_input *text_input =
 		relay_get_focused_text_input(popup->relay);
 
-	if (!popup->desc.relative) {
+	if (!popup->desc.relative || !text_input) {
 		return;
 	}
 
@@ -162,9 +162,15 @@ static void constrain_popup(struct sway_input_popup *popup) {
 	if (cursor_rect) {
 		cursor_area = text_input->input->current.cursor_rectangle;
 	} else {
+		// Glassine: no cursor rectangle (Chromium sends none): where the
+		// field is, is unknown. The popup lies over the top of the window
+		// (as if the cursor were its top edge): inside the window, and in a
+		// place that doesn't change when the window's height does. The whole
+		// window as the cursor (upstream) put it beyond the window's bottom
+		// or top edge, mostly off the output once the window filled it.
 		cursor_area = (struct wlr_box) {
 			.width = parent.width,
-			.height = parent.height,
+			.height = 0,
 		};
 	}
 
@@ -197,6 +203,13 @@ static void constrain_popup(struct sway_input_popup *popup) {
 	if (available_down < popup_height && available_up > available_down) {
 		y = y1 - popup_height;
 	}
+	// Glassine: on the output, as x is
+	if (y + popup_height > output_box.y + output_box.height) {
+		y = output_box.y + output_box.height - popup_height;
+	}
+	if (y < output_box.y) {
+		y = output_box.y;
+	}
 
 	wlr_scene_node_set_position(popup->desc.relative, x - parent.x - geo.x, y - parent.y - geo.y);
 	if (cursor_rect) {
@@ -206,8 +219,14 @@ static void constrain_popup(struct sway_input_popup *popup) {
 			.width = cursor_area.width,
 			.height = cursor_area.height,
 		};
-		wlr_input_popup_surface_v2_send_text_input_rectangle(
-			popup->popup_surface, &box);
+		// Glassine: constrain runs at every commit of the field's surface
+		// too; the input method hears of a change only
+		if (!popup->rect_sent || !wlr_box_equal(&box, &popup->sent_rect)) {
+			wlr_input_popup_surface_v2_send_text_input_rectangle(
+				popup->popup_surface, &box);
+			popup->sent_rect = box;
+			popup->rect_sent = true;
+		}
 	}
 
 	if (popup->scene_tree) {
@@ -374,6 +393,8 @@ static void relay_handle_text_input(struct wl_listener *listener,
 static void input_popup_set_focus(struct sway_input_popup *popup,
 		struct wlr_surface *surface) {
 	wl_list_remove(&popup->focused_surface_unmap.link);
+	wl_list_remove(&popup->focused_surface_commit.link);
+	wl_list_init(&popup->focused_surface_commit.link);
 
 	if (!popup->scene_tree) {
 		wl_list_init(&popup->focused_surface_unmap.link);
@@ -430,6 +451,7 @@ static void input_popup_set_focus(struct sway_input_popup *popup,
 		return;
 	}
 
+	wl_signal_add(&surface->events.commit, &popup->focused_surface_commit);
 	constrain_popup(popup);
 	wlr_scene_node_set_enabled(&popup->scene_tree->node, true);
 }
@@ -439,6 +461,7 @@ static void handle_im_popup_destroy(struct wl_listener *listener, void *data) {
 		wl_container_of(listener, popup, popup_destroy);
 	wlr_scene_node_destroy(&popup->scene_tree->node);
 	wl_list_remove(&popup->focused_surface_unmap.link);
+	wl_list_remove(&popup->focused_surface_commit.link);
 	wl_list_remove(&popup->popup_surface_commit.link);
 	wl_list_remove(&popup->popup_surface_map.link);
 	wl_list_remove(&popup->popup_surface_unmap.link);
@@ -473,6 +496,14 @@ static void handle_im_popup_surface_unmap(struct wl_listener *listener, void *da
 static void handle_im_popup_surface_commit(struct wl_listener *listener, void *data) {
 	struct sway_input_popup *popup =
 		wl_container_of(listener, popup, popup_surface_commit);
+
+	constrain_popup(popup);
+}
+
+static void handle_im_focused_surface_commit(
+		struct wl_listener *listener, void *data) {
+	struct sway_input_popup *popup =
+		wl_container_of(listener, popup, focused_surface_commit);
 
 	constrain_popup(popup);
 }
@@ -524,6 +555,8 @@ static void handle_im_new_popup_surface(struct wl_listener *listener,
 	popup->popup_surface_unmap.notify = handle_im_popup_surface_unmap;
 	wl_list_init(&popup->focused_surface_unmap.link);
 	popup->focused_surface_unmap.notify = handle_im_focused_surface_unmap;
+	wl_list_init(&popup->focused_surface_commit.link);
+	popup->focused_surface_commit.notify = handle_im_focused_surface_commit;
 
 	struct sway_text_input *text_input = relay_get_focused_text_input(relay);
 	if (text_input != NULL) {
