@@ -443,6 +443,32 @@ static bool penblock_swallow(int32_t id, bool down, bool up) {
 	return false;
 }
 
+/*
+ * Glassine: while a writing surface is up (the on-screen keyboard's
+ * handwriting paper: an input-method popup with ink areas), a touch that
+ * lands outside the input method's own surfaces (the paper, its keys) is the
+ * writing hand. The hand rests on the app below the paper and lands before
+ * the pen comes into range, and again between words; as a tap it blurred the
+ * text field, which closed the paper. Such a touch is held like a palm under
+ * a pen in range: it reaches no app, moves no focus and starts no gesture,
+ * until it lifts. A finger still taps the paper's controls and the keys; the
+ * pen still reaches anything. Off with pen palm rejection (/etc/glassine/pen-palm).
+ */
+static bool paperblock_holds(struct sway_seat *seat, int32_t id, double lx, double ly) {
+	if (!penblock_on() || !sway_input_method_relay_writing_up(&seat->im_relay)) {
+		return false;
+	}
+	struct wlr_surface *surface = NULL;
+	double sx, sy;
+	node_at_coords(seat, lx, ly, &surface, &sx, &sy);
+	if (sway_input_method_relay_owns_surface(&seat->im_relay, surface)) {
+		return false;
+	}
+	penblock_add(penblock_held, &penblock_nheld, id);
+	sway_log(SWAY_DEBUG, "glassine: touch %d ignored, the writing paper is up", id);
+	return true;
+}
+
 static void penblock_tool_event(void) {
 	penblock_last = get_current_time_msec();
 }
@@ -885,6 +911,10 @@ static void handle_touch_down(struct wl_listener *listener, void *data) {
 	double lx, ly;
 	wlr_cursor_absolute_to_layout_coords(cursor->cursor, &event->touch->base,
 			event->x, event->y, &lx, &ly);
+
+	if (paperblock_holds(seat, event->touch_id, lx, ly)) {
+		return;
+	}
 
 	if (glassine_g_on()) {
 		glassine_g_touch = event->touch;

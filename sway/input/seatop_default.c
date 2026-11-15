@@ -1,6 +1,7 @@
 #include <float.h>
 #include <libevdev/libevdev.h>
 #include <wlr/types/wlr_cursor.h>
+#include <wlr/types/wlr_input_method_v2.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_tablet_v2.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -358,6 +359,20 @@ static void handle_button(struct sway_seat *seat, uint32_t time_msec,
 	// Handle mouse bindings
 	if (trigger_pointer_button_binding(seat, device, button, state, modifiers,
 			on_titlebar, on_border, on_contents, on_workspace)) {
+		return;
+	}
+
+	// Glassine: a click on an input-method popup (the on-screen keyboard's
+	// handwriting paper, the pen as an emulated pointer) goes to the popup and
+	// never moves focus: the popup belongs to the focused text input, and over
+	// a layer surface node_at_coords gives the workspace, whose focus would
+	// close it. The down seatop keeps a drag on the popup.
+	if (surface && wlr_input_popup_surface_v2_try_from_wlr_surface(
+			wlr_surface_get_root_surface(surface))) {
+		if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+			seatop_begin_down_on_surface(seat, surface, sx, sy);
+		}
+		seat_pointer_notify_button(seat, time_msec, button, state);
 		return;
 	}
 

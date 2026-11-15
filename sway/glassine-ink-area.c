@@ -22,6 +22,13 @@
  * tip=<id> / rub=<id> after its 9 numbers, the brush written once as
  * /run/glassine-ink/<id>.brush (epd-brush.h; GLASSINE_INK_DIR overrides the dir, for
  * the host test). KIND is then 2/3/1 by the brush's ink kind, the exponent 1.
+ * Besides windows, two kinds of surfaces without a view ink when their client
+ * registered areas: input-method popups (the on-screen keyboard's handwriting
+ * paper) and layer-shell surfaces, each with its subsurfaces, at its current
+ * position and cut by everything above it like a window. They have no per-app
+ * default: without areas of their own (or with null areas) they only cover.
+ * APP: the layer surface's namespace, "input-method" for a popup. Menus
+ * (xdg popups) always only cover.
  * Nothing happens when glassine-epdd-desktop isn't there (O_NONBLOCK open fails). */
 #include <ctype.h>
 #include <math.h>
@@ -38,6 +45,8 @@
 #include <wlr/util/transform.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_input_method_v2.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_scene.h>
 #include "log.h"
 #include "sway/commands.h"
@@ -64,7 +73,10 @@
  * a CSD window to its geometry and wlroots then puts the buffer at the clip's
  * origin, so the surface origin is b minus the clip (the app's areas are in
  * surface coordinates: GTK's shadow would offset them otherwise) */
-struct item { struct wlr_box b; int ox, oy; struct sway_view *v; struct wlr_surface *s; };
+/* v: the window it belongs to; own: else the input-method popup or layer
+ * surface it belongs to (its root surface), NULL for anything else (menus,
+ * drag icons...: those only cover) */
+struct item { struct wlr_box b; int ox, oy; struct sway_view *v; struct wlr_surface *s, *own; };
 
 /* ---- glassine_ink_brush_v1 (v3): a declarative brush ----
  * Refcounted: its resource holds one ref, every surface tool selecting it
@@ -123,6 +135,12 @@ static struct ink_surf *ink_surf_for(struct wlr_surface *s)
 		}
 	}
 	return NULL;
+}
+
+bool glassine_ink_has_areas(struct wlr_surface *s)
+{
+	struct ink_surf *i = s ? ink_surf_for(s) : NULL;
+	return i && i->set && pixman_region32_not_empty(&i->areas);
 }
 
 static void brush_unuse(struct ink_brush *b);
@@ -683,6 +701,26 @@ static struct sway_view *view_of(struct wlr_scene_node *n)
 	return NULL;
 }
 
+/* the surface's view-less ink owner: its root surface when that is an
+ * input-method popup or a layer surface (an xdg popup's root is itself) and
+ * its client set areas on it or a subsurface; else NULL (it only covers, and
+ * takes none of the MAXV slots) */
+static struct wlr_surface *owner_of(struct wlr_surface *s)
+{
+	struct wlr_surface *r = s ? wlr_surface_get_root_surface(s) : NULL;
+	if (!r || !(wlr_input_popup_surface_v2_try_from_wlr_surface(r) ||
+			wlr_layer_surface_v1_try_from_wlr_surface(r))) {
+		return NULL;
+	}
+	struct ink_surf *i;
+	wl_list_for_each(i, &ink_surfs, link) {
+		if (i->res && i->set && wlr_surface_get_root_surface(i->surface) == r) {
+			return r;
+		}
+	}
+	return NULL;
+}
+
 static void collect(struct wlr_scene_buffer *sb, int lx, int ly, void *data)
 {
 	struct walk *w = data;
@@ -701,7 +739,9 @@ static void collect(struct wlr_scene_buffer *sb, int lx, int ly, void *data)
 	}
 	struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(sb);
 	int ox = ss ? lx - ss->clip.x : lx, oy = ss ? ly - ss->clip.y : ly;
-	w->it[w->n++] = (struct item){ { lx, ly, bw, bh }, ox, oy, view_of(&sb->node), ss ? ss->surface : NULL };
+	struct sway_view *v = view_of(&sb->node);
+	struct wlr_surface *s = ss ? ss->surface : NULL;
+	w->it[w->n++] = (struct item){ { lx, ly, bw, bh }, ox, oy, v, s, v ? NULL : owner_of(s) };
 }
 
 static void app_name(struct sway_view *v, char *c, size_t len)
@@ -718,6 +758,19 @@ static void app_name(struct sway_view *v, char *c, size_t len)
 		*p = tolower((unsigned char)*p);
 		if (*p == '\n' || *p == '\r') {
 			*p = ' ';
+		}
+	}
+}
+
+/* a view-less owner's APP: the layer namespace, else "input-method" */
+static void owner_name(struct wlr_surface *own, char *c, size_t len)
+{
+	struct wlr_layer_surface_v1 *l = wlr_layer_surface_v1_try_from_wlr_surface(own);
+	snprintf(c, len, "%s", l && l->namespace && *l->namespace ? l->namespace : l ? "layer-shell" : "input-method");
+	for (char *p = c; *p; p++) {
+		*p = tolower((unsigned char)*p);
+		if (isspace((unsigned char)*p)) {
+			*p = '-';       /* one token, as the line's last field */
 		}
 	}
 }
@@ -762,7 +815,8 @@ void glassine_ink_update(struct sway_output *output)
 	float sc = output->wlr_output->scale;
 	int ow = (int)(ob.width * sc + 0.5), oh = (int)(ob.height * sc + 0.5), rot = rotation();
 
-	struct sway_view *vs[MAXV];
+	struct sway_view *vs[MAXV];     /* the windows, or NULL: */
+	struct wlr_surface *os[MAXV];   /* a view-less owner (popup, layer surface) */
 	struct ink_surf *bs[MAXV];      /* the window's brush (an ink_surf with set_brush) */
 	pixman_region32_t vis[MAXV], sdk[MAXV], occl;
 	bool has_sdk[MAXV];
@@ -773,13 +827,14 @@ void glassine_ink_update(struct sway_output *output)
 		if (!wlr_box_intersection(&b, &b, &ob)) {
 			continue;
 		}
-		if (w.it[i].v) {
+		if (w.it[i].v || w.it[i].own) {
 			int k = 0;
-			while (k < nv && vs[k] != w.it[i].v) {
+			while (k < nv && (vs[k] != w.it[i].v || os[k] != w.it[i].own)) {
 				k++;
 			}
 			if (k == nv && nv < MAXV) {
 				vs[nv] = w.it[i].v;
+				os[nv] = w.it[i].own;
 				has_sdk[nv] = false;
 				bs[nv] = NULL;
 				pixman_region32_init(&sdk[nv]);
@@ -795,7 +850,9 @@ void glassine_ink_update(struct sway_output *output)
 				if (is && (is->br[0].kind || is->br[1].kind) && !bs[k]) {
 					bs[k] = is;
 				}
-				if (is && is->set) {        /* the app's areas, from its surface's origin */
+				/* the app's areas, from its surface's origin (a view-less
+				 * owner's only from its client, never from the command) */
+				if (is && is->set && (w.it[i].v || is->res)) {
 					pixman_region32_t a;
 					pixman_region32_init(&a);
 					pixman_region32_copy(&a, &is->areas);
@@ -814,7 +871,7 @@ void glassine_ink_update(struct sway_output *output)
 	int n = snprintf(msg, sizeof msg, "ink begin\n"), nb = 0, bk[MAXV];
 	for (int k = 0; k < nv; k++) {              /* the brushes first: widths x the output scale */
 		bk[k] = 0;
-		if (bs[k] && n < (int)sizeof msg - 400) {
+		if (bs[k] && (vs[k] || has_sdk[k]) && n < (int)sizeof msg - 400) {
 			bk[k] = ++nb;
 			unsigned kind[2];
 			const char *id[2];
@@ -832,7 +889,16 @@ void glassine_ink_update(struct sway_output *output)
 	for (int k = 0; k < nv; k++) {
 		char app[128], line[MSG];
 		int ln = 0, nr;
-		app_name(vs[k], app, sizeof app);
+		if (!vs[k] && !has_sdk[k]) {    /* a popup or layer surface without areas: covers only */
+			pixman_region32_fini(&sdk[k]);
+			pixman_region32_fini(&vis[k]);
+			continue;
+		}
+		if (vs[k]) {
+			app_name(vs[k], app, sizeof app);
+		} else {
+			owner_name(os[k], app, sizeof app);
+		}
 		if (has_sdk[k]) {
 			pixman_region32_intersect(&vis[k], &vis[k], &sdk[k]);
 		}

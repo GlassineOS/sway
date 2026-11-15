@@ -60,6 +60,15 @@ void sway_input_method_relay_init(struct sway_seat *seat,
 
 void sway_input_method_relay_finish(struct sway_input_method_relay *relay);
 
+// Glassine: an input-method popup with ink areas (the on-screen keyboard's
+// handwriting paper) is shown
+bool sway_input_method_relay_writing_up(struct sway_input_method_relay *relay);
+
+// Glassine: the surface belongs to the input method's client (its popups,
+// its keyboard)
+bool sway_input_method_relay_owns_surface(struct sway_input_method_relay *relay,
+	struct wlr_surface *surface);
+
 // Updates currently focused surface. Surface must belong to the same seat.
 void sway_input_method_relay_set_focus(struct sway_input_method_relay *relay,
 	struct wlr_surface *surface);
