@@ -451,9 +451,25 @@ static bool penblock_swallow(int32_t id, bool down, bool up) {
  * the pen comes into range, and again between words; as a tap it blurred the
  * text field, which closed the paper. Such a touch is held like a palm under
  * a pen in range: it reaches no app, moves no focus and starts no gesture,
- * until it lifts. A finger still taps the paper's controls and the keys; the
- * pen still reaches anything. Off with pen palm rejection (/etc/glassine/pen-palm).
+ * until it lifts. A finger still taps the paper's controls and the keys, and
+ * the shell's top bar (a "glassine-shell" layer surface on the top edge, not
+ * one that also reaches the bottom: that is the shell's full-screen backdrop);
+ * the pen still reaches anything. Off with pen palm rejection
+ * (/etc/glassine/pen-palm).
  */
+static bool paperblock_top_bar(struct wlr_surface *surface) {
+	if (!surface) {
+		return false;
+	}
+	struct wlr_layer_surface_v1 *layer =
+		wlr_layer_surface_v1_try_from_wlr_surface(wlr_surface_get_root_surface(surface));
+	if (!layer || !layer->namespace || strcmp(layer->namespace, "glassine-shell")) {
+		return false;
+	}
+	uint32_t a = layer->current.anchor;
+	return (a & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) && !(a & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM);
+}
+
 static bool paperblock_holds(struct sway_seat *seat, int32_t id, double lx, double ly) {
 	if (!penblock_on() || !sway_input_method_relay_writing_up(&seat->im_relay)) {
 		return false;
@@ -461,10 +477,12 @@ static bool paperblock_holds(struct sway_seat *seat, int32_t id, double lx, doub
 	struct wlr_surface *surface = NULL;
 	double sx, sy;
 	node_at_coords(seat, lx, ly, &surface, &sx, &sy);
-	if (sway_input_method_relay_owns_surface(&seat->im_relay, surface)) {
+	if (sway_input_method_relay_owns_surface(&seat->im_relay, surface) ||
+			paperblock_top_bar(surface)) {
 		return false;
 	}
 	penblock_add(penblock_held, &penblock_nheld, id);
+	penblock_del(penblock_down, &penblock_ndown, id); /* never the session's */
 	sway_log(SWAY_DEBUG, "glassine: touch %d ignored, the writing paper is up", id);
 	return true;
 }
