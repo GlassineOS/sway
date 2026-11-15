@@ -171,16 +171,25 @@ static void constrain_popup(struct sway_input_popup *popup) {
 	int popup_width = popup->popup_surface->surface->current.width;
 	int popup_height = popup->popup_surface->surface->current.height;
 	int x1 = parent.x + cursor_area.x;
-	int x2 = parent.x + cursor_area.x + cursor_area.width;
 	int y1 = parent.y + cursor_area.y;
 	int y2 = parent.y + cursor_area.y + cursor_area.height;
-	int x = x1;
 	int y = y2;
 
-	int available_right = output_box.x + output_box.width - x1;
-	int available_left = x2 - output_box.x;
-	if (available_right < popup_width && available_left > available_right) {
-		x = x2 - popup_width;
+	// Glassine: the popup keeps a fixed horizontal position, centred on the
+	// window that holds the text field (on the output for a fixed_output
+	// popup), so it doesn't follow the cursor along a line. Vertically it
+	// still sits at the cursor line, which stands for the field.
+	int x;
+	if (popup->desc.view) {
+		x = parent.x + geo.x + (geo.width - popup_width) / 2;
+	} else {
+		x = output_box.x + (output_box.width - popup_width) / 2;
+	}
+	if (x + popup_width > output_box.x + output_box.width) {
+		x = output_box.x + output_box.width - popup_width;
+	}
+	if (x < output_box.x) {
+		x = output_box.x;
 	}
 
 	int available_down = output_box.y + output_box.height - y2;
