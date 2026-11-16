@@ -33,6 +33,7 @@
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "sway/desktop/transaction.h"
 #include "glassine-gesture.h"
+#include "../glassine-handwriting-sway.h"
 #include "../glassine-gesture-action.h"
 
 /* Glassine : N-finger swipes on the touchscreen, in the compositor.
@@ -1222,6 +1223,11 @@ static void handle_tool_axis(struct wl_listener *listener, void *data) {
 		wlr_tablet_v2_tablet_tool_notify_wheel(
 			sway_tool->tablet_v2_tool, event->wheel_delta, 0);
 	}
+
+	/* Glassine: the pen interface's stroke follows the tool */
+	glassine_hw_sway_axis(cursor, sway_tool,
+		event->updated_axes & WLR_TABLET_TOOL_AXIS_PRESSURE ? event->pressure : NAN,
+		event->time_msec);
 }
 
 static void handle_tool_tip(struct wl_listener *listener, void *data) {
@@ -1239,6 +1245,10 @@ static void handle_tool_tip(struct wl_listener *listener, void *data) {
 	struct wlr_surface *surface = NULL;
 	node_at_coords(seat, cursor->cursor->x, cursor->cursor->y,
 		&surface, &sx, &sy);
+
+	/* Glassine: a stroke for the pen interface (glassine-handwriting.c) */
+	glassine_hw_sway_tip(cursor, sway_tool, surface, sx, sy, event->time_msec,
+		event->state == WLR_TABLET_TOOL_TIP_DOWN);
 
 	if (cursor->simulating_pointer_from_tool_tip &&
 			event->state == WLR_TABLET_TOOL_TIP_UP) {
@@ -1299,6 +1309,7 @@ static void handle_tool_proximity(struct wl_listener *listener, void *data) {
 	}
 
 	if (event->state == WLR_TABLET_TOOL_PROXIMITY_OUT) {
+		glassine_hw_sway_out(event->time_msec);
 		penblock_pen_out();
 		wlr_tablet_v2_tablet_tool_notify_proximity_out(sway_tool->tablet_v2_tool);
 		return;

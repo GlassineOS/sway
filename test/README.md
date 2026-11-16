@@ -24,6 +24,15 @@ the popup without moving focus. SWAY: a `build-glassine.sh` binary for the host'
 architecture (as in CI); without it the container builds this tree. Logs go to
 `build-test/ink-popup/`.
 
+`handwriting-test.sh [SWAY]` runs too (Docker, as `ink-popup-test.sh`): the pen interface's
+global, its capabilities without the service, and with a stand-in service that the test
+starts through sway (its channel on fd 3) the capabilities it gives, the surface it is told
+of with the app's pid, the surface's choices and its end. Headless sway has no tablet, so
+the strokes themselves are tested with `handwriting-standin.sh`: it builds
+`handwriting-standin.c`, a Wayland server with `glassine-handwriting.c` and a stand-in pen on
+stdin (the host's C compiler, libwayland-server, json-c), which GlassineOS/handwriting's
+tests run the service and the client library against.
+
 `shm-seal-test.sh` runs too (curl, patch and a C compiler): it builds wlroots' `util/shm.c`
 with our patches and checks that the pixman renderer's buffers take `F_SEAL_SHRINK`, as the
 panel daemon requires, and that the backend's memfds (the cursor) allow sealing.
