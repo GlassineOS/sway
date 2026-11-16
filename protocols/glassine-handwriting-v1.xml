@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="glassine_handwriting_v1">
+  <copyright>
+    SPDX-License-Identifier: GPL-2.0-or-later
+  </copyright>
+  <description summary="handwriting for an app's writing surface: raw and neat ink, text">
+    The pen interface of GlassineOS handwriting (GlassineOS/handwriting spec 004, and the
+    neat ink layer of spec 003). An app turns it on for a surface; the compositor then
+    passes each pen stroke written there to the app as a vector stroke when the pen lifts,
+    and, with the handwriting service behind it, the stroke's neatened version, readings
+    while the person writes and ranked candidates at a pause. The app reports what the
+    person did with a reading; that is the confirmation the person's samples learn from.
+
+    The compositor identifies the app (its sandbox's application id, or the program it
+    runs), never the app itself, and sends the service only what the surface turned on:
+    nothing with both neatening and text off, nothing at all for a private field. The pen's
+    preview on the panel stays the raw stroke (glassine_ink_v1); the app draws whichever
+    version it keeps with its next frame.
+
+    The same pen events still reach the app through the tablet protocol as before; this
+    interface adds the strokes as the compositor saw them, numbered, so that readings and
+    neatened strokes can name them.
+
+    Points are arrays of 6 int32 per point, in this order: x and y (wl_fixed, surface
+    coordinates, y down), the time (milliseconds, the tablet events' clock), the pressure
+    (0..65535, 0 when the tool reports none) and the tilt in x and y (wl_fixed, degrees from
+    the vertical, 0 when the tool reports none): the values the tablet protocol sends.
+    A stroke's points come in parts, so that no message outgrows the wire: zero or more
+    points events, each with at most 128 points, then the stroke or neat_stroke event that
+    ends them. Strings in events are at most 1024 bytes.
+  </description>
+
+  <interface name="glassine_handwriting_manager_v1" version="1">
+    <description summary="handwriting surfaces">
+      On bind the compositor sends capabilities and the languages, then done; again
+      whenever they change (the service starts or stops, a letter model appears).
+    </description>
+
+    <request name="destroy" type="destructor"/>
+
+    <enum name="error">
+      <entry name="already_exists" value="0" summary="the surface has a handwriting object"/>
+    </enum>
+
+    <request name="get_handwriting">
+      <description summary="the pen interface for a surface">
+        At most one per wl_surface. It does not take the surface's ink areas
+        (glassine_ink_v1, one per surface): an app, or the GTK ink module, may set
+        those as before. A new object has neatening and text off and the whole surface
+        as its area: it passes on raw strokes only.
+      </description>
+      <arg name="id" type="new_id" interface="glassine_handwriting_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+
+    <enum name="capability" bitfield="true">
+      <entry name="strokes" value="1" summary="raw strokes (always)"/>
+      <entry name="neaten" value="2" summary="neatened strokes (the service is there)"/>
+      <entry name="text" value="4" summary="readings and candidates (the service is there)"/>
+      <entry name="letters" value="8" summary="the person has a letter model: neatening pulls letters to it, not only the line"/>
+    </enum>
+
+    <event name="capabilities">
+      <arg name="capabilities" type="uint" enum="capability"/>
+    </event>
+
+    <event name="language">
+      <description summary="a language that can be read, in the service's order"/>
+      <arg name="language" type="string" summary="a language tag, en, de"/>
+    </event>
+
+    <event name="done">
+      <description summary="the capabilities and languages above are complete"/>
+    </event>
+  </interface>
+
+  <interface name="glassine_handwriting_v1" version="1">
+    <description summary="the pen interface on one surface">
+      Choices take effect for strokes that start after them, except set_neaten, which
+      also neatens again the writing the surface holds (a change of strength without new
+      pen input). Strokes are numbered from 0 per object and never reused; clear empties
+      what the object holds without restarting the numbers.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="nothing more is sent; the service forgets the surface's ink"/>
+    </request>
+
+    <request name="set_area">
+      <description summary="where strokes count, in surface coordinates">
+        A stroke counts when it starts inside the region. The region is copied. Null: the
+        whole surface.
+      </description>
+      <arg name="region" type="object" interface="wl_region" allow-null="true"/>
+    </request>
+
+    <request name="set_guides">
+      <description summary="the area's ruled lines">
+        The lines the writing sits on: the first at y first (wl_fixed, surface coordinates),
+        the next ones every spacing below it. Neatening goes line by line; each stroke
+        belongs to the line it is written on, a descender reaching a little below its
+        guide. spacing 0 (the start): no guides, the lines are found from the writing.
+      </description>
+      <arg name="spacing" type="fixed"/>
+      <arg name="first" type="fixed"/>
+    </request>
+
+    <request name="set_neaten">
+      <description summary="neatening on or off, and its strength">
+        strength 0 to 1 (wl_fixed, clamped): 0 passes the raw strokes as neat strokes,
+        1 the neatest. Turning it on, or a new strength, neatens the writing held again.
+      </description>
+      <arg name="enabled" type="uint"/>
+      <arg name="strength" type="fixed"/>
+    </request>
+
+    <request name="set_text">
+      <description summary="readings and candidates on or off (off: none are made for this surface)"/>
+      <arg name="enabled" type="uint"/>
+    </request>
+
+    <enum name="purpose">
+      <entry name="normal" value="0" summary="prose"/>
+      <entry name="alpha" value="1"/>
+      <entry name="digits" value="2"/>
+      <entry name="number" value="3"/>
+      <entry name="phone" value="4"/>
+      <entry name="url" value="5"/>
+      <entry name="email" value="6"/>
+      <entry name="name" value="7"/>
+      <entry name="password" value="8" summary="private: nothing is sent to the service"/>
+      <entry name="pin" value="9" summary="private: nothing is sent to the service"/>
+      <entry name="date" value="10"/>
+      <entry name="time" value="11"/>
+      <entry name="datetime" value="12"/>
+      <entry name="terminal" value="13"/>
+    </enum>
+
+    <request name="set_context">
+      <description summary="the field the writing goes into">
+        purpose and hints as in zwp_text_input_v3 (the values are the same), the text
+        before and after the cursor (UTF-8, at most 4000 bytes each, the end nearest the
+        cursor kept), languages a comma-separated list in order (empty: the person's
+        setting). Takes effect for the next piece of writing (after clear or a report).
+      </description>
+      <arg name="purpose" type="uint" enum="purpose"/>
+      <arg name="hints" type="uint"/>
+      <arg name="before" type="string"/>
+      <arg name="after" type="string"/>
+      <arg name="languages" type="string"/>
+    </request>
+
+    <request name="clear">
+      <description summary="the app is done with the writing held: it is forgotten"/>
+    </request>
+
+    <enum name="action">
+      <entry name="picked" value="0" summary="the person picked candidate rank of the reading"/>
+      <entry name="accepted" value="1" summary="the person accepted the reading's best candidate"/>
+      <entry name="corrected" value="2" summary="the person corrected it to text"/>
+      <entry name="discarded" value="3" summary="the person threw the writing away"/>
+    </enum>
+
+    <request name="report">
+      <description summary="what the person did with a reading">
+        serial names the candidates (candidates_done). picked: rank is the candidate's
+        (0 best), text its text; accepted: rank 0; corrected: text is what the person
+        made of it; discarded: text empty. A pick, an acceptance or a correction stores
+        the raw strokes of that reading with the text as one of the person's samples,
+        when the person allows this app to learn and the field learns; the writing is then
+        forgotten as with clear. The answer is report_done.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="action" type="uint" enum="action"/>
+      <arg name="rank" type="uint"/>
+      <arg name="text" type="string"/>
+    </request>
+
+    <enum name="kind">
+      <entry name="raw" value="0" summary="for a stroke event"/>
+      <entry name="neat" value="1" summary="for a neat_stroke event"/>
+    </enum>
+
+    <event name="points">
+      <description summary="a part of a stroke's points">
+        At most 128 points (as in the protocol's description) of stroke stroke, in order;
+        the parts add up until the stroke (kind raw) or neat_stroke (kind neat) event of the
+        same stroke number. Parts of two strokes never interleave.
+      </description>
+      <arg name="stroke" type="uint"/>
+      <arg name="kind" type="uint" enum="kind"/>
+      <arg name="points" type="array"/>
+    </event>
+
+    <event name="stroke">
+      <description summary="a raw stroke, sent when the pen lifts">
+        Every stroke that starts in the area, as the tablet reported it: the points events
+        just before it. Sent by the compositor itself, without the service.
+      </description>
+      <arg name="stroke" type="uint"/>
+    </event>
+
+    <enum name="how">
+      <entry name="kept" value="0" summary="passed unchanged (drawing, a gesture, not read)"/>
+      <entry name="line" value="1" summary="line-level corrections only"/>
+      <entry name="pulled" value="2" summary="also pulled towards the person's letters"/>
+    </enum>
+
+    <event name="neat_stroke">
+      <description summary="the neatened version of a raw stroke">
+        Replaces raw stroke stroke (or its earlier neat_stroke): the points events just
+        before it, the same points with only x and y moved. Sent once the writing it belongs
+        to is read, and again when later strokes or a new strength change it.
+      </description>
+      <arg name="stroke" type="uint"/>
+      <arg name="how" type="uint" enum="how"/>
+    </event>
+
+    <event name="reading">
+      <description summary="a partial reading while the person writes (text on)">
+        The best reading of the strokes so far; a newer one replaces it. strokes: the
+        stroke numbers it covers (array of uint32), at most the last 512 of them.
+      </description>
+      <arg name="text" type="string"/>
+      <arg name="strokes" type="array"/>
+    </event>
+
+    <enum name="origin">
+      <entry name="ink" value="0" summary="the ink's own best reading"/>
+      <entry name="beam" value="1" summary="another reading of the ink"/>
+      <entry name="words" value="2" summary="a word of the list one edit from a reading"/>
+      <entry name="guided" value="3" summary="the search the words guided"/>
+    </enum>
+
+    <event name="candidate">
+      <description summary="one ranked candidate at a pause (text on)">
+        rank 0 is the best. fit 1 when a pick of it is stored as it is, 0 when it would be
+        checked and not pass. chars: per character of text, the strokes that make it, as
+        in the recognizer's reading (docs/recognizer.md ALIGN, with this object's stroke
+        numbers): entries separated by ";", each stroke N or N:A-B (points A to B); empty
+        when it would be longer than 1024 bytes.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="rank" type="uint"/>
+      <arg name="text" type="string"/>
+      <arg name="origin" type="uint" enum="origin"/>
+      <arg name="fit" type="uint"/>
+      <arg name="chars" type="string"/>
+    </event>
+
+    <event name="candidates_done">
+      <description summary="the candidates above (count of them) are complete">
+        serial names them in report. count 0: nothing could be read.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="count" type="uint"/>
+    </event>
+
+    <enum name="result">
+      <entry name="stored" value="0" summary="kept as a sample"/>
+      <entry name="not_kept" value="1" summary="nothing to keep: discarded, a field that doesn't learn, learning off, or the strokes didn't fit the text"/>
+      <entry name="not_allowed" value="2" summary="the person doesn't let this app learn (or hasn't been asked)"/>
+      <entry name="stale" value="3" summary="serial is not the newest candidates of this object"/>
+      <entry name="unavailable" value="4" summary="the service isn't there"/>
+    </enum>
+
+    <event name="report_done">
+      <arg name="serial" type="uint"/>
+      <arg name="result" type="uint" enum="result"/>
+    </event>
+  </interface>
+</protocol>
