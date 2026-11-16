@@ -13,6 +13,8 @@ sway_sources = files(
 	'glassine-epd-backend.c',
 	'glassine-popup-hint.c',
 	'glassine-ink-area.c',
+	'glassine-handwriting.c',
+	'glassine-handwriting-sway.c',
 	'epd-brush.c',
 	'sway_text_node.c',
 	'swaynag.c',

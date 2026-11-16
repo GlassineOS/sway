@@ -55,6 +55,7 @@
 #include "sway/output.h"
 #include "sway/server.h"
 #include "glassine-ink-area.h"
+#include "glassine-handwriting-sway.h"
 #include "glassine-epd-backend.h"
 #include "sway/input/cursor.h"
 #include "sway/tree/root.h"
@@ -280,6 +281,8 @@ bool server_init(struct sway_server *server) {
 	wlr_subcompositor_create(server->wl_display);
 	/* Glassine: the pen's ink areas (glassine-ink-v1.xml) */
 	glassine_ink_init(server->wl_display);
+	/* Glassine: the pen interface of handwriting (glassine-handwriting-v1.xml) */
+	glassine_hw_sway_init(server->wl_display);
 
 	server->data_device_manager =
 		wlr_data_device_manager_create(server->wl_display);
