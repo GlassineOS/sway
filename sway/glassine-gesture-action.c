@@ -65,6 +65,83 @@ void glassine_ga_lookup(const char *path, int fingers, const char *what, char *a
 	snprintf(act, len, "%s", glassine_ga_canon(*a ? a : d ? d : "nothing"));
 }
 
+const char *glassine_ga_edge_default(const char *edge) {
+	if (!strcmp(edge, "top")) {
+		return "show-bar";
+	}
+	if (!strcmp(edge, "bottom") || !strcmp(edge, "left") || !strcmp(edge, "right")) {
+		return "nothing";
+	}
+	return NULL;
+}
+
+/* the edge's line as it is (no exit guard) */
+static void edge_lookup(const char *path, const char *edge, char *act, size_t len) {
+	const char *d = glassine_ga_edge_default(edge);
+	char a[64] = "", line[256], k[16], w[16], v[64];
+	FILE *f = path ? fopen(path, "r") : NULL;
+	if (f) {
+		while (fgets(line, sizeof line, f)) {
+			if (line[0] != '#' && sscanf(line, "%15s %15s %63s", k, w, v) == 3
+					&& !strcmp(k, "edge") && !strcmp(w, edge)) {
+				snprintf(a, sizeof a, "%s", v);
+			}
+		}
+		fclose(f);
+	}
+	snprintf(act, len, "%s", glassine_ga_canon(*a ? a : d ? d : "nothing"));
+}
+
+int glassine_ga_edge_armed(const char *act, int immersive) {
+	if (!strcmp(act, "nothing")) {
+		return 0;
+	}
+	return strcmp(act, "show-bar") || immersive;
+}
+
+int glassine_ga_is_exit(const char *act) {
+	static const char *const exits[] = { "unfullscreen", "minimize", "home", "overview", "show-bar" };
+	act = glassine_ga_canon(act);
+	for (size_t i = 0; i < sizeof exits / sizeof *exits; i++) {
+		if (!strcmp(act, exits[i])) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+int glassine_ga_has_exit(const char *path) {
+	static const char *const dirs[4] = { "left", "right", "up", "down" };
+	static const char *const edges[4] = { "top", "bottom", "left", "right" };
+	char act[64];
+	for (int fingers = 3; fingers <= 4; fingers++) {
+		for (int i = 0; i < 4; i++) {
+			glassine_ga_lookup(path, fingers, dirs[i], act, sizeof act);
+			if (glassine_ga_is_exit(act)) {
+				return 1;
+			}
+		}
+	}
+	glassine_ga_lookup(path, 2, "tap", act, sizeof act);
+	if (glassine_ga_is_exit(act)) {
+		return 1;
+	}
+	for (int i = 0; i < 4; i++) {
+		edge_lookup(path, edges[i], act, sizeof act);
+		if (glassine_ga_is_exit(act)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void glassine_ga_edge_lookup(const char *path, const char *edge, char *act, size_t len) {
+	edge_lookup(path, edge, act, len);
+	if (!strcmp(edge, "top") && !glassine_ga_is_exit(act) && !glassine_ga_has_exit(path)) {
+		snprintf(act, len, "%s", "show-bar");
+	}
+}
+
 const char *glassine_ga_global(const char *act) {
 	static const char *const global[][2] = {
 		{ "refresh", "exec /usr/bin/glassine-refresh" },
@@ -74,6 +151,7 @@ const char *glassine_ga_global(const char *act) {
 		{ "overview", "exec /usr/bin/glassine-shell toggle overview" },
 		{ "quick", "exec /usr/bin/glassine-shell toggle quick" },
 		{ "notices", "exec /usr/bin/glassine-shell toggle notices" },
+		{ "show-bar", "exec /usr/bin/glassine-shell bar show" },
 	};
 	for (size_t i = 0; i < sizeof global / sizeof *global; i++) {
 		if (!strcmp(act, global[i][0])) {
@@ -87,7 +165,7 @@ enum glassine_ga_full glassine_ga_full(const char *act, unsigned long con_id, in
 		char *buf, size_t len) {
 	int on = !strcmp(act, "fullscreen");
 	if (!strcmp(act, "minimize")) {
-		if (!marked) {
+		if (!marked && !sway_full) {
 			return GLASSINE_GA_NOT_FULL_ACTION;
 		}
 		on = 0;
@@ -96,10 +174,11 @@ enum glassine_ga_full glassine_ga_full(const char *act, unsigned long con_id, in
 	if (!on && strcmp(act, "unfullscreen")) {
 		return GLASSINE_GA_NOT_FULL_ACTION;
 	}
-	/* swayd's `full W` toggles, and it turns off a window in sway's own fullscreen
-	 * as well as a marked one. So it is sent only when that is what was asked: a
-	 * window in sway's fullscreen is already shown full screen (swayd treats both
-	 * kinds alike), and `fullscreen` on it does nothing */
+	/* swayd's `full W` toggles sway's own fullscreen of W (an older swayd: its
+	 * mark, GLASSINE_GA_FULL_MARK). So it is sent only when that is what was asked:
+	 * `fullscreen` on a window in sway's fullscreen does nothing (it is full screen
+	 * already), and unfullscreen/minimize of one is sway's `fullscreen disable`;
+	 * a window still carrying the old mark goes back through swayd */
 	if (on && sway_full && !marked) {
 		return GLASSINE_GA_NOTHING;
 	}
