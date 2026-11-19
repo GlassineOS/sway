@@ -92,6 +92,13 @@ static void edge_lookup(const char *path, const char *edge, char *act, size_t le
 	snprintf(act, len, "%s", glassine_ga_canon(*a ? a : d ? d : "nothing"));
 }
 
+int glassine_ga_edge_armed(const char *act, int immersive) {
+	if (!strcmp(act, "nothing")) {
+		return 0;
+	}
+	return strcmp(act, "show-bar") || immersive;
+}
+
 int glassine_ga_is_exit(const char *act) {
 	static const char *const exits[] = { "unfullscreen", "minimize", "home", "overview", "show-bar" };
 	act = glassine_ga_canon(act);
