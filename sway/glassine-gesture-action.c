@@ -70,10 +70,10 @@ const char *glassine_ga_global(const char *act) {
 		{ "refresh", "exec /usr/bin/glassine-refresh" },
 		{ "screen-next", "workspace next_on_output" },
 		{ "screen-prev", "workspace prev_on_output" },
-		{ "home", "exec /usr/bin/glassine-shell-wl home" },
-		{ "overview", "exec /usr/bin/glassine-shell-wl toggle overview" },
-		{ "quick", "exec /usr/bin/glassine-shell-wl toggle quick" },
-		{ "notices", "exec /usr/bin/glassine-shell-wl toggle notices" },
+		{ "home", "exec /usr/bin/glassine-shell home" },
+		{ "overview", "exec /usr/bin/glassine-shell toggle overview" },
+		{ "quick", "exec /usr/bin/glassine-shell toggle quick" },
+		{ "notices", "exec /usr/bin/glassine-shell toggle notices" },
 	};
 	for (size_t i = 0; i < sizeof global / sizeof *global; i++) {
 		if (!strcmp(act, global[i][0])) {

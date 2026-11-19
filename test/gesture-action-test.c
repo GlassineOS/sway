@@ -122,10 +122,10 @@ int main(int argc, char **argv) {
 	eq("gestures file", path, "/h/.config/glassine/gestures");
 
 	/* the shell's requests and the other global actions */
-	eq("home", glassine_ga_global("home"), "exec /usr/bin/glassine-shell-wl home");
-	eq("overview", glassine_ga_global("overview"), "exec /usr/bin/glassine-shell-wl toggle overview");
-	eq("quick", glassine_ga_global("quick"), "exec /usr/bin/glassine-shell-wl toggle quick");
-	eq("notices", glassine_ga_global("notices"), "exec /usr/bin/glassine-shell-wl toggle notices");
+	eq("home", glassine_ga_global("home"), "exec /usr/bin/glassine-shell home");
+	eq("overview", glassine_ga_global("overview"), "exec /usr/bin/glassine-shell toggle overview");
+	eq("quick", glassine_ga_global("quick"), "exec /usr/bin/glassine-shell toggle quick");
+	eq("notices", glassine_ga_global("notices"), "exec /usr/bin/glassine-shell toggle notices");
 	eq("screen-next", glassine_ga_global("screen-next"), "workspace next_on_output");
 	eq("screen-prev", glassine_ga_global("screen-prev"), "workspace prev_on_output");
 	eq("refresh", glassine_ga_global("refresh"), "exec /usr/bin/glassine-refresh");
