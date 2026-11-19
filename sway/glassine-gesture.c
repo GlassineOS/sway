@@ -11,6 +11,7 @@ void glassine_g_init(struct glassine_gesture *g, int fingers, double swipe_px)
     g->tap_ms = 400;
     g->tap_join_ms = 250;
     g->tap_px = 15;
+    g->edge_px = 24;
 }
 
 void glassine_g_tap_init(struct glassine_gesture *g, int tap_ms, int join_ms, double px)
@@ -71,6 +72,7 @@ static int find(const struct glassine_gesture *g, int32_t id)
 
 static void drop(struct glassine_gesture *g, int i)
 {
+    if (g->edge && g->pt[i].id == g->edge_id) g->edge = 0;
     g->pt[i] = g->pt[--g->n];
     if (!g->n) g->active = g->fired = g->most = g->tap = 0;   /* the last finger is up: the gesture is over */
 }
@@ -84,8 +86,32 @@ static void travel(const struct glassine_gesture *g, double *dx, double *dy)
     if (g->n) { *dx /= g->n; *dy /= g->n; }
 }
 
+void glassine_g_edges(struct glassine_gesture *g, double x, double y, double w, double h, unsigned armed)
+{
+    g->bx = x; g->by = y; g->bw = w; g->bh = h;
+    g->armed = armed;
+}
+
+unsigned glassine_g_edge_near(const struct glassine_gesture *g, double px, double py,
+    double x, double y, double w, double h)
+{
+    if (g->n || g->active || g->nheld || w <= 0 || h <= 0) return 0;
+    if (px < x || py < y || px >= x + w || py >= y + h) return 0;
+    unsigned m = 0;
+    if (py - y <= g->edge_px) m |= GLASSINE_G_E_TOP;
+    if (y + h - py <= g->edge_px) m |= GLASSINE_G_E_BOTTOM;
+    if (px - x <= g->edge_px) m |= GLASSINE_G_E_LEFT;
+    if (x + w - px <= g->edge_px) m |= GLASSINE_G_E_RIGHT;
+    return m;
+}
+
 enum glassine_g_result glassine_g_down(struct glassine_gesture *g, int32_t id, double x, double y)
 {
+    unsigned armed = g->armed;
+    g->armed = 0;                       /* the arming is for this down only */
+    /* a second finger, or the candidate's id down again (its up lost): no edge swipe */
+    g->edge = 0;
+    unsigned near = armed ? glassine_g_edge_near(g, x, y, g->bx, g->by, g->bw, g->bh) & armed : 0;
     int i = find(g, id);
     if (i < 0) {
         if (g->n == GLASSINE_G_MAXPT) return g->active ? GLASSINE_G_SWALLOW : GLASSINE_G_PASS;
@@ -97,6 +123,12 @@ enum glassine_g_result glassine_g_down(struct glassine_gesture *g, int32_t id, d
     if (g->n == 1 && !g->active && !g->nheld) {           /* a new sequence: may become a tap */
         g->tap = g->tap_ms ? 1 : 0;
         g->t0 = g->now;
+        if (near && g->n == 1) {        /* alone near an armed edge: a candidate */
+            g->edge = near;
+            g->edge_id = id;
+            g->ex = x;
+            g->ey = y;
+        }
     } else if (g->tap == 1 && g->n == 2 && g->now - g->t0 <= g->tap_join_ms) {
         g->tap = 2;
         g->tx = (g->pt[0].x + g->pt[1].x) / 2;
@@ -133,6 +165,21 @@ enum glassine_g_result glassine_g_motion(struct glassine_gesture *g, int32_t id,
     g->pt[i].y = y;
     if (g->tap && (fabs(x - g->pt[i].x0) > g->tap_px || fabs(y - g->pt[i].y0) > g->tap_px || tap_late(g)))
         tap_fail(g);
+    if (g->edge && id == g->edge_id) {
+        double dx = x - g->pt[i].x0, dy = y - g->pt[i].y0;
+        if (fabs(dx) < g->swipe_px && fabs(dy) < g->swipe_px) return GLASSINE_G_PASS;
+        /* far enough: the main direction decides, once */
+        unsigned e = fabs(dy) > fabs(dx) ? (dy > 0 ? GLASSINE_G_E_TOP : GLASSINE_G_E_BOTTOM)
+            : fabs(dx) > fabs(dy) ? (dx > 0 ? GLASSINE_G_E_LEFT : GLASSINE_G_E_RIGHT) : 0;
+        unsigned near = g->edge;
+        g->edge = 0;
+        if (!(e & near)) return GLASSINE_G_PASS;
+        if (g->tap) tap_fail(g);
+        g->active = g->fired = 1;       /* the rest of the sequence is swallowed */
+        g->most = g->n;
+        return e == GLASSINE_G_E_TOP ? GLASSINE_G_EDGE_TOP : e == GLASSINE_G_E_BOTTOM ? GLASSINE_G_EDGE_BOTTOM
+            : e == GLASSINE_G_E_LEFT ? GLASSINE_G_EDGE_LEFT : GLASSINE_G_EDGE_RIGHT;
+    }
     if (!g->active) return GLASSINE_G_PASS;
     if (g->fired) return GLASSINE_G_SWALLOW;
     double dx, dy;
