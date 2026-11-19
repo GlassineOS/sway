@@ -11,7 +11,9 @@
  * missing file or line: the default. Exit guard (GlassineOS/shell spec 001
  * FR-062): when no trigger (3/4-finger swipes, 2 tap, edges) maps to one of
  * unfullscreen, minimize, home, overview, show-bar, the top edge is show-bar
- * whatever its line says (glassine_ga_edge_lookup). Action ids:
+ * whatever its line says (glassine_ga_edge_lookup). An edge whose action is
+ * show-bar is only tracked over an immersive window (glassine_ga_edge_armed).
+ * Action ids:
  *   home              the shell's Home (glassine-shell home)
  *   overview          the shell's overview (glassine-shell toggle overview)
  *   quick, notices    the shell's popups
@@ -48,6 +50,12 @@ const char *glassine_ga_edge_default(const char *edge);
 /* the action of edge EDGE from the gestures file at path (NULL: the
  * defaults'), mapped by glassine_ga_canon, with the exit guard applied to top */
 void glassine_ga_edge_lookup(const char *path, const char *edge, char *act, size_t len);
+/* 1: an edge with action act (glassine_ga_edge_lookup's) is tracked, given
+ * whether the output under the landing point shows an immersive window (sway's
+ * fullscreen on its workspace, or a global one): never for nothing, show-bar
+ * only over an immersive window (it does nothing otherwise, so it must not take
+ * the apps' or the bar's touches), any other action always */
+int glassine_ga_edge_armed(const char *act, int immersive);
 /* 1: act is one that leaves an immersive window (the exit guard's list) */
 int glassine_ga_is_exit(const char *act);
 /* 1: some trigger in the file at path (or its default) runs an exit action */

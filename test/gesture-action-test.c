@@ -144,6 +144,25 @@ int main(int argc, char **argv) {
 	/* "edge" lines are not finger lines, and "3 edge" is not an edge line */
 	eq("file 3 edge is a finger line", lookup(path, 3, "edge"), "home");
 
+	/* which edges are tracked: show-bar only over an immersive window */
+	static const struct { const char *act; int immersive, want; } arm[] = {
+		{ "show-bar", 0, 0 }, { "show-bar", 1, 1 }, { "nothing", 0, 0 }, { "nothing", 1, 0 },
+		{ "home", 0, 1 }, { "home", 1, 1 }, { "minimize", 0, 1 }, { "screen-next", 0, 1 },
+	};
+	for (size_t i = 0; i < sizeof arm / sizeof *arm; i++) {
+		checks++;
+		if (glassine_ga_edge_armed(arm[i].act, arm[i].immersive) != arm[i].want) {
+			fails++;
+			printf("FAIL edge armed %s immersive %d: want %d\n", arm[i].act, arm[i].immersive, arm[i].want);
+		}
+	}
+	/* the default top (show-bar) and the guard's show-bar alike */
+	checks++;
+	if (glassine_ga_edge_armed(edge(NULL, "top"), 0) || !glassine_ga_edge_armed(edge(NULL, "top"), 1)) {
+		fails++;
+		printf("FAIL default top edge: armed only over an immersive window\n");
+	}
+
 	/* the exit guard (FR-062) */
 	static const char *const exits[] = { "unfullscreen", "minimize", "home", "overview", "show-bar", "launcher" };
 	for (size_t i = 0; i < sizeof exits / sizeof *exits; i++) {
@@ -175,6 +194,11 @@ int main(int argc, char **argv) {
 		printf("FAIL no-exit file has an exit\n");
 	}
 	eq("guard: top nothing -> show-bar", edge(path, "top"), "show-bar");
+	checks++;
+	if (glassine_ga_edge_armed(edge(path, "top"), 0) || !glassine_ga_edge_armed(edge(path, "top"), 1)) {
+		fails++;
+		printf("FAIL guard's top show-bar: armed only over an immersive window\n");
+	}
 	eq("guard: bottom kept", edge(path, "bottom"), "refresh");
 	eq("guard: right kept", edge(path, "right"), "quick");
 	eq("guard: left kept", edge(path, "left"), "nothing");

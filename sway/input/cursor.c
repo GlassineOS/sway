@@ -65,7 +65,9 @@
  * FR-062 makes top show-bar when nothing else leaves an immersive window).
  * The app gets the touch at once and a cancel when the swipe is recognised;
  * the rest of the sequence is swallowed. An edge set to nothing is not
- * tracked. Window actions: the window where the finger landed.
+ * tracked, nor one set to show-bar unless the output shows an immersive
+ * window (sway's fullscreen). Window actions: the window where the finger
+ * landed.
  * Two-finger tap : a right click where the fingers were, for apps
  * whose menus only open on a mouse right click (sway has no long press =
  * right click as glassine-touchd on X had: a hold stays the apps'). The line
@@ -247,11 +249,16 @@ static void glassine_g_arm_edges(double lx, double ly) {
 	}
 	if (near) {
 		char path[512], act[64];
+		/* an immersive window on this output: sway's fullscreen on its active
+		 * workspace, or a global one (show-bar is armed only then) */
+		struct sway_output *so = output_from_wlr_output(o);
+		struct sway_workspace *ws = so ? output_get_active_workspace(so) : NULL;
+		int immersive = root->fullscreen_global || (ws && ws->fullscreen);
 		glassine_ga_file(path, sizeof path);
 		for (int e = 0; e < 4; e++) {
 			if (near & (1u << e)) {
 				glassine_ga_edge_lookup(path, glassine_g_edge_names[e], act, sizeof act);
-				if (strcmp(act, "nothing")) {
+				if (glassine_ga_edge_armed(act, immersive)) {
 					armed |= 1u << e;
 				}
 			}
