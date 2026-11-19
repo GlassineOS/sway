@@ -127,7 +127,7 @@ static bool glassine_g_full(struct sway_seat *seat, struct sway_container *con, 
 		if (glassine_ga_send(path, buf) < 0) {
 			sway_log_errno(SWAY_ERROR, "glassine: %s (%s): glassine-swayd %s", what, act, path);
 		} else {
-			sway_log(SWAY_DEBUG, "glassine: %s (%s): glassine-swayd %s", what, act, buf);
+			sway_log(SWAY_INFO, "glassine: %s (%s): glassine-swayd %s", what, act, buf);
 		}
 		return true;
 	case GLASSINE_GA_SWAY:;
@@ -137,7 +137,7 @@ static bool glassine_g_full(struct sway_seat *seat, struct sway_container *con, 
 		transaction_commit_dirty();
 		return true;
 	default:
-		sway_log(SWAY_DEBUG, "glassine: %s (%s): already so", what, act);
+		sway_log(SWAY_INFO, "glassine: %s (%s): already so", what, act);
 		return true;
 	}
 }
@@ -152,7 +152,7 @@ static void glassine_g_run(struct sway_seat *seat, const char *act, double x, do
 		struct sway_node *node = node_at_coords(seat, x, y, &surface, &sx, &sy);
 		struct sway_container *con = node && node->type == N_CONTAINER ? node->sway_container : NULL;
 		if (!con || !con->view) {
-			sway_log(SWAY_DEBUG, "glassine: %s (%s) at %.0f,%.0f: no window there", what, act, x, y);
+			sway_log(SWAY_INFO, "glassine: %s (%s) at %.0f,%.0f: no window there", what, act, x, y);
 			return;
 		}
 		if (glassine_g_full(seat, con, act, what)) {
@@ -212,10 +212,10 @@ static void glassine_g_run(struct sway_seat *seat, const char *act, double x, do
 		}
 	}
 	if (!cmd) {
-		sway_log(SWAY_DEBUG, "glassine: %s: %s, nothing to do", what, act);
+		sway_log(SWAY_INFO, "glassine: %s: %s, nothing to do", what, act);
 		return;
 	}
-	sway_log(SWAY_DEBUG, "glassine: %s (%s): %s", what, act, cmd);
+	sway_log(SWAY_INFO, "glassine: %s (%s): %s", what, act, cmd);
 	struct sway_binding binding = { .type = BINDING_KEYSYM, .command = (char *)cmd };
 	seat_execute_command(seat, &binding);
 	transaction_commit_dirty();
@@ -333,7 +333,17 @@ static void glassine_g_cancel_apps(struct sway_cursor *cursor, struct wlr_touch 
 		}
 	}
 	glassine_g_cancel_ids(cursor, touch, time_msec, ids, k);
-	sway_log(SWAY_DEBUG, "glassine: %d-finger gesture, %d app touches cancelled", n, n - 1);
+	/* at INFO, with the ids: a touch whose up never came would show here as
+	 * one more finger than the hand put down */
+	int32_t all[GLASSINE_G_MAXPT];
+	char idl[64];
+	size_t o = 0;
+	idl[0] = 0;
+	glassine_g_points(&gest, all, GLASSINE_G_MAXPT);
+	for (int i = 0; i < n && o < sizeof idl; i++) {
+		o += snprintf(idl + o, sizeof idl - o, "%s%d", i ? "," : "", all[i]);
+	}
+	sway_log(SWAY_INFO, "glassine: %d-finger gesture (touches %s), %d app touches cancelled", n, idl, k);
 }
 
 static uint32_t get_current_time_msec(void) {
@@ -915,10 +925,45 @@ static void handle_pointer_frame(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_frame(cursor->seat->wlr_seat);
 }
 
+/* the touchscreen the gesture and palm state belong to. When it goes (the
+ * device replaced, e.g. around a suspend) with fingers down, their ups never
+ * come: the state is reset with it, else those touches stay counted (one finger
+ * more for every later gesture, and a gesture that never ends swallows every
+ * touch), and the pointers to it would dangle (the tap timer uses one) */
+static struct wlr_touch *glassine_watched;
+static struct wl_listener glassine_touch_destroy;
+
+static void glassine_touch_gone(struct wl_listener *listener, void *data) {
+	wl_list_remove(&glassine_touch_destroy.link);
+	glassine_watched = NULL;
+	sway_log(SWAY_INFO, "glassine: touchscreen gone (%d touches down, %d held for the pen): "
+		"gesture state reset", gest.n, penblock_nheld);
+	glassine_g_state = 0; /* glassine_g_on initialises it again */
+	glassine_g_touch = NULL;
+	penblock_touch = NULL;
+	penblock_ndown = penblock_nheld = 0;
+	if (glassine_g_timer) {
+		wl_event_source_timer_update(glassine_g_timer, 0);
+	}
+}
+
+static void glassine_touch_watch(struct wlr_touch *touch) {
+	if (touch == glassine_watched) {
+		return;
+	}
+	if (glassine_watched) {
+		wl_list_remove(&glassine_touch_destroy.link);
+	}
+	glassine_watched = touch;
+	glassine_touch_destroy.notify = glassine_touch_gone;
+	wl_signal_add(&touch->base.events.destroy, &glassine_touch_destroy);
+}
+
 static void handle_touch_down(struct wl_listener *listener, void *data) {
 	struct sway_cursor *cursor = wl_container_of(listener, cursor, touch_down);
 	struct wlr_touch_down_event *event = data;
 	cursor_handle_activity_from_device(cursor, &event->touch->base);
+	glassine_touch_watch(event->touch);
 	penblock_touch = event->touch;
 	if (penblock_swallow(event->touch_id, true, false)) {
 		return;

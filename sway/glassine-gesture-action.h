@@ -7,8 +7,8 @@
  * lines "FINGERS WHAT ACTION", FINGERS 3 or 4 with WHAT up/down/left/right, or
  * "2 tap ACTION"; '#' starts a comment line; the last matching line wins; a
  * missing file or line: the default. Action ids:
- *   home              the shell's Home (glassine-shell-wl home)
- *   overview          the shell's overview (glassine-shell-wl toggle overview)
+ *   home              the shell's Home (glassine-shell home)
+ *   overview          the shell's overview (glassine-shell toggle overview)
  *   quick, notices    the shell's popups
  *   screen-next, screen-prev   the next/previous screen (sway workspace)
  *   refresh           a full e-ink refresh
