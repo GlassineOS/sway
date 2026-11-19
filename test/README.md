@@ -14,6 +14,14 @@ defaults, and the request each action sends (glassine-swayd's socket faked in a 
 `XDG_RUNTIME_DIR`). The binary goes to `build-test/`, which git ignores; the fake socket's
 directory goes under `$TMPDIR` (`/tmp`), since a deep checkout's path would be over the 108-byte
 socket path limit. A `$TMPDIR` that is still too long makes the test exit 77: a skip, not a pass.
+It also checks the `edge EDGE ACTION` lines, their defaults (top `show-bar`, the others `nothing`)
+and the exit guard (no trigger leaves an immersive window: the top edge is `show-bar`).
+
+`gesture-edge-test.sh` runs too, with the host's C compiler: it checks the edge swipes in
+`sway/glassine-gesture.c` (a finger landing alone within 24 px of an armed edge of the output's
+box and moving straight inward by the swipe distance; what is no edge swipe: too far from the
+edge, an edge set to `nothing`, sideways or outward, too short, a second finger first; and that
+the rest of the sequence is swallowed). The touch glue in `sway/input/cursor.c` is not covered.
 
 `ink-popup-test.sh [SWAY]` runs too (Docker): it runs this sway headless in Alpine 3.24 with
 `ink-popup-client.c` (a window, a layer surface, input-method popups and a virtual pointer)
