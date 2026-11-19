@@ -32,7 +32,7 @@
 #include "sway/tree/workspace.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "sway/desktop/transaction.h"
-#include "glassine-gesture.h"
+#include "../glassine-gesture.h"
 #include "../glassine-handwriting-sway.h"
 #include "../glassine-gesture-action.h"
 
@@ -47,17 +47,25 @@
  * glassine-gesture-action.h. FINGERS 3 or 4 (a 4th finger before the swipe
  * makes it a 4-finger one). Window actions act on the window under the
  * fingers (where the gesture began; none there: nothing):
- * fullscreen, unfullscreen through glassine-swayd's `full` (the bar stays
- * above the window; never sway's fullscreen)
- * minimize a fullscreen window (glassine-swayd's or sway's): back from
- * fullscreen; a maximized one:
+ * fullscreen, unfullscreen: immersive (sway's own fullscreen, set through
+ * glassine-swayd's `full`) or back (`fullscreen disable`)
+ * minimize a fullscreen window: back from fullscreen; a maximized one:
  * back to its tile; else to sway's scratchpad (glassine-shell
  * lists those in its workspaces popup and brings them back)
  * close, swap (with the next tile),
  * move-next, move-prev (to the next/previous workspace, and along)
  * page-up, page-down (that key to it: wtype)
  * the others: nothing, refresh (a full e-ink refresh), screen-next,
- * screen-prev, home, overview, quick, notices (glassine-shell's requests).
+ * screen-prev, home, overview, quick, notices, show-bar (glassine-shell's
+ * requests).
+ * Edge swipes (GlassineOS/shell spec 001 FR-060): one finger landing alone
+ * within 24 layout px of an edge of its output (as the output is turned) and
+ * moving straight inward by GLASSINE_SWIPE_PX runs "edge EDGE ACTION" of the
+ * same file (top: show-bar, the others nothing by default; the exit guard of
+ * FR-062 makes top show-bar when nothing else leaves an immersive window).
+ * The app gets the touch at once and a cancel when the swipe is recognised;
+ * the rest of the sequence is swallowed. An edge set to nothing is not
+ * tracked. Window actions: the window where the finger landed.
  * Two-finger tap : a right click where the fingers were, for apps
  * whose menus only open on a mouse right click (sway has no long press =
  * right click as glassine-touchd on X had: a hold stays the apps'). The line
@@ -107,8 +115,9 @@ static void glassine_g_action(int fingers, int dir, char *act, size_t len) {
 	glassine_g_lookup(fingers >= 4 ? 4 : 3, glassine_g_dirs[dir], act, len);
 }
 
-/* fullscreen, unfullscreen, and minimize of a window glassine-swayd holds full
- * screen: through glassine-swayd (glassine_ga_full). false: not handled here */
+/* fullscreen, unfullscreen, and minimize of a full-screen window: through
+ * glassine-swayd's `full` or sway's `fullscreen disable` (glassine_ga_full).
+ * false: not handled here */
 static bool glassine_g_full(struct sway_seat *seat, struct sway_container *con, const char *act, const char *what) {
 	char buf[128], path[108];
 	bool marked = container_has_mark(con, GLASSINE_GA_FULL_MARK);
@@ -117,12 +126,6 @@ static bool glassine_g_full(struct sway_seat *seat, struct sway_container *con, 
 	case GLASSINE_GA_NOT_FULL_ACTION:
 		return false;
 	case GLASSINE_GA_SWAYD:
-		if (!marked && container_is_floating(con)) {
-			/* swayd's `full` looks only among the tiled windows and the ones it holds full
-			 * itself (marked): for any other floating one it logs "no window" and does nothing */
-			sway_log(SWAY_INFO, "glassine: %s (%s): a floating window can't be made full screen", what, act);
-			return true;
-		}
 		glassine_ga_swayd_path(path, sizeof path);
 		if (glassine_ga_send(path, buf) < 0) {
 			sway_log_errno(SWAY_ERROR, "glassine: %s (%s): glassine-swayd %s", what, act, path);
@@ -227,6 +230,34 @@ static void glassine_g_command(struct sway_seat *seat, enum glassine_g_result r)
 	glassine_g_action(fingers, dir, act, sizeof act);
 	snprintf(what, sizeof what, "%d-finger swipe %s", fingers, glassine_g_dirs[dir]);
 	glassine_g_run(seat, act, gest.cx, gest.cy, what);
+}
+
+static const char *const glassine_g_edge_names[4] = { "top", "bottom", "left", "right" };
+
+/* before a down at lx, ly: arm the edges of its output that have an action.
+ * The gestures file is read only for a down that can start an edge swipe and
+ * lands near an edge */
+static void glassine_g_arm_edges(double lx, double ly) {
+	struct wlr_output *o = wlr_output_layout_output_at(root->output_layout, lx, ly);
+	struct wlr_box b = {0};
+	unsigned near = 0, armed = 0;
+	if (o) {
+		wlr_output_layout_get_box(root->output_layout, o, &b);
+		near = glassine_g_edge_near(&gest, lx, ly, b.x, b.y, b.width, b.height);
+	}
+	if (near) {
+		char path[512], act[64];
+		glassine_ga_file(path, sizeof path);
+		for (int e = 0; e < 4; e++) {
+			if (near & (1u << e)) {
+				glassine_ga_edge_lookup(path, glassine_g_edge_names[e], act, sizeof act);
+				if (strcmp(act, "nothing")) {
+					armed |= 1u << e;
+				}
+			}
+		}
+	}
+	glassine_g_edges(&gest, b.x, b.y, b.width, b.height, armed);
 }
 
 static void handle_touch_cancel(struct wl_listener *listener, void *data);
@@ -344,6 +375,19 @@ static void glassine_g_cancel_apps(struct sway_cursor *cursor, struct wlr_touch 
 		o += snprintf(idl + o, sizeof idl - o, "%s%d", i ? "," : "", all[i]);
 	}
 	sway_log(SWAY_INFO, "glassine: %d-finger gesture (touches %s), %d app touches cancelled", n, idl, k);
+}
+
+/* an edge swipe: the app's touch of that finger is cancelled, then the edge's
+ * action runs (window actions: the window where the finger landed) */
+static void glassine_g_edge(struct sway_cursor *cursor, struct wlr_touch *touch,
+		uint32_t time_msec, int32_t id, enum glassine_g_result r) {
+	const char *edge = glassine_g_edge_names[r - GLASSINE_G_EDGE_TOP];
+	char path[512], act[64], what[64];
+	glassine_ga_file(path, sizeof path);
+	glassine_ga_edge_lookup(path, edge, act, sizeof act);
+	glassine_g_cancel_ids(cursor, touch, time_msec, &id, 1);
+	snprintf(what, sizeof what, "edge swipe %s", edge);
+	glassine_g_run(cursor->seat, act, gest.ex, gest.ey, what);
 }
 
 static uint32_t get_current_time_msec(void) {
@@ -983,6 +1027,7 @@ static void handle_touch_down(struct wl_listener *listener, void *data) {
 	if (glassine_g_on()) {
 		glassine_g_touch = event->touch;
 		glassine_g_clock(&gest, event->time_msec);
+		glassine_g_arm_edges(lx, ly);
 		enum glassine_g_result r = glassine_g_down(&gest, event->touch_id, lx, ly);
 		glassine_g_flush_ups(cursor, event->touch, event->time_msec);
 		glassine_g_timer_update(cursor);
@@ -1088,6 +1133,9 @@ static void handle_touch_motion(struct wl_listener *listener, void *data) {
 		glassine_g_timer_update(cursor);
 		if (r >= GLASSINE_G_SWIPE_LEFT && r <= GLASSINE_G_SWIPE_DOWN) {
 			glassine_g_command(seat, r);
+		}
+		if (r >= GLASSINE_G_EDGE_TOP && r <= GLASSINE_G_EDGE_RIGHT) {
+			glassine_g_edge(cursor, event->touch, event->time_msec, event->touch_id, r);
 		}
 		if (r != GLASSINE_G_PASS) {
 			return;

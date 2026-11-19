@@ -27,7 +27,20 @@
  * held-back up is due: the glue delivers what glassine_g_flush returns before it
  * acts on the event. "Too slow" is noticed at the next touch event, or by the
  * glue's timer (glassine_g_hold_ms, glassine_g_tick). glassine_g_clock sets the time of the
- * events. */
+ * events.
+ *
+ * Edge swipes (GlassineOS/shell spec 001 FR-060): before a down the glue
+ * gives the output's box under the landing point (layout coordinates, the
+ * output as it is turned) and the edges that have an action (glassine_g_edges;
+ * only for that down). A finger that lands alone (no other touch down) within
+ * edge_px (24) of an armed edge is a candidate: its touch still goes to the
+ * app at once (PASS). When its own travel first reaches swipe_px, the main
+ * direction decides: straight inward from an armed edge it was near returns
+ * GLASSINE_G_EDGE_TOP..RIGHT once (the glue cancels the app's touch of that
+ * finger and runs the edge's action at ex, ey, where it landed), and the rest
+ * of the sequence is swallowed, as after a swipe; any other direction: no
+ * edge swipe. A second finger, its up or a cancel ends the candidate. An edge
+ * that is not armed is not tracked at all. */
 #ifndef GLASSINE_GESTURE_H
 #define GLASSINE_GESTURE_H
 #include <stdint.h>
@@ -43,7 +56,17 @@ enum glassine_g_result {
     GLASSINE_G_SWIPE_UP,
     GLASSINE_G_SWIPE_DOWN,
     GLASSINE_G_TAP2,          /* drop it; a two-finger tap: cancel tap_ids, run the tap at tx, ty */
+    GLASSINE_G_EDGE_TOP,      /* drop it; an edge swipe: cancel the finger's app touch, run the edge's action at ex, ey */
+    GLASSINE_G_EDGE_BOTTOM,
+    GLASSINE_G_EDGE_LEFT,
+    GLASSINE_G_EDGE_RIGHT,
 };
+
+/* the edges, as bits for glassine_g_edges (in the order of the results) */
+#define GLASSINE_G_E_TOP    (1u << 0)
+#define GLASSINE_G_E_BOTTOM (1u << 1)
+#define GLASSINE_G_E_LEFT   (1u << 2)
+#define GLASSINE_G_E_RIGHT  (1u << 3)
 
 struct glassine_gesture {
     int fingers;        /* touches that make a gesture (3) */
@@ -62,6 +85,13 @@ struct glassine_gesture {
     double tx, ty;
     int nheld, nflush, ntap;
     int32_t held[GLASSINE_G_MAXPT], flush[GLASSINE_G_MAXPT], tap_ids[GLASSINE_G_MAXPT];
+    /* edge swipes */
+    double edge_px;     /* how near an edge a finger lands (24) */
+    double bx, by, bw, bh;  /* the output's box for the next down (glassine_g_edges) */
+    unsigned armed;     /* the edges with an action, for the next down only */
+    unsigned edge;      /* the candidate's edges (those it landed near), 0: none */
+    int32_t edge_id;    /* the candidate's touch */
+    double ex, ey;      /* where it landed */
 };
 
 void glassine_g_init(struct glassine_gesture *g, int fingers, double swipe_px);
@@ -77,6 +107,14 @@ int glassine_g_tick(struct glassine_gesture *g);
 uint32_t glassine_g_hold_ms(const struct glassine_gesture *g);
 /* ups held back for a tap that will not come: deliver these first (returns how many) */
 int glassine_g_flush(struct glassine_gesture *g, int32_t *ids, int max);
+/* the box of the output under the next down and the edges (GLASSINE_G_E_*)
+ * that have an action; used by that down only */
+void glassine_g_edges(struct glassine_gesture *g, double x, double y, double w, double h, unsigned armed);
+/* the edges of box x, y, w, h that a down at px, py would be near, if it can
+ * start an edge swipe (no touch down): 0 otherwise. For the glue, to look up
+ * only those edges' actions */
+unsigned glassine_g_edge_near(const struct glassine_gesture *g, double px, double py,
+    double x, double y, double w, double h);
 enum glassine_g_result glassine_g_down(struct glassine_gesture *g, int32_t id, double x, double y);
 enum glassine_g_result glassine_g_motion(struct glassine_gesture *g, int32_t id, double x, double y);
 enum glassine_g_result glassine_g_up(struct glassine_gesture *g, int32_t id);

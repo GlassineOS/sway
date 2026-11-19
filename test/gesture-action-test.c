@@ -30,6 +30,12 @@ static const char *lookup(const char *path, int fingers, const char *what) {
 	return act;
 }
 
+static const char *edge(const char *path, const char *e) {
+	static char act[64];
+	glassine_ga_edge_lookup(path, e, act, sizeof act);
+	return act;
+}
+
 static void write_file(const char *path, const char *text) {
 	FILE *f = fopen(path, "w");
 	if (!f || fputs(text, f) < 0 || fclose(f)) {
@@ -69,7 +75,7 @@ int main(int argc, char **argv) {
 	eq("canon maximize", glassine_ga_canon("maximize"), "fullscreen");
 	static const char *const same[] = { "home", "overview", "screen-next", "screen-prev", "fullscreen",
 		"unfullscreen", "minimize", "close", "swap", "move-next", "move-prev", "refresh", "quick",
-		"notices", "page-up", "page-down", "nothing", "right-click", "something-new" };
+		"notices", "page-up", "page-down", "nothing", "right-click", "show-bar", "something-new" };
 	for (size_t i = 0; i < sizeof same / sizeof *same; i++) {
 		eq("canon keeps", glassine_ga_canon(same[i]), same[i]);
 	}
@@ -90,6 +96,14 @@ int main(int argc, char **argv) {
 		eq(what, lookup(NULL, atoi(def[i][0]), def[i][1]), def[i][2]);
 	}
 	eq("default 5 up", lookup(path, 5, "up"), "nothing");
+	eq("default edge top", edge(path, "top"), "show-bar");
+	eq("default edge bottom", edge(path, "bottom"), "nothing");
+	eq("default edge left", edge(path, "left"), "nothing");
+	eq("default edge right", edge(path, "right"), "nothing");
+	eq("default edge top, no path", edge(NULL, "top"), "show-bar");
+	eq("edge default top", glassine_ga_edge_default("top"), "show-bar");
+	eq("edge default right", glassine_ga_edge_default("right"), "nothing");
+	eq("edge default middle", glassine_ga_edge_default("middle"), NULL);
 	eq("default 3 tap", lookup(path, 3, "tap"), "nothing");
 
 	/* a file with old ids, new ids, a comment and a later line that wins */
@@ -105,6 +119,14 @@ int main(int argc, char **argv) {
 		"4 right home\n"
 		"4 right screen-next\n"
 		"2 tap launcher\n"
+		"edge top home\n"
+		"edge bottom overview\n"
+		"# edge left minimize\n"
+		"edge left nothing\n"
+		"edge right swap\n"
+		"edge right launcher\n"
+		"edge middle home\n"
+		"3 edge home\n"
 		"garbage\n");
 	eq("file 4 up launcher", lookup(path, 4, "up"), "home");
 	eq("file 3 left ws-prev", lookup(path, 3, "left"), "screen-prev");
@@ -115,6 +137,72 @@ int main(int argc, char **argv) {
 	eq("file 4 right last line", lookup(path, 4, "right"), "screen-next");
 	eq("file 4 down default", lookup(path, 4, "down"), "refresh");
 	eq("file 2 tap launcher", lookup(path, 2, "tap"), "home");
+	eq("file edge top", edge(path, "top"), "home");
+	eq("file edge bottom", edge(path, "bottom"), "overview");
+	eq("file edge left (comment skipped)", edge(path, "left"), "nothing");
+	eq("file edge right last line, mapped", edge(path, "right"), "home");
+	/* "edge" lines are not finger lines, and "3 edge" is not an edge line */
+	eq("file 3 edge is a finger line", lookup(path, 3, "edge"), "home");
+
+	/* the exit guard (FR-062) */
+	static const char *const exits[] = { "unfullscreen", "minimize", "home", "overview", "show-bar", "launcher" };
+	for (size_t i = 0; i < sizeof exits / sizeof *exits; i++) {
+		checks++;
+		if (!glassine_ga_is_exit(exits[i])) {
+			fails++;
+			printf("FAIL %s is an exit\n", exits[i]);
+		}
+	}
+	static const char *const no_exits[] = { "fullscreen", "maximize", "close", "nothing", "quick", "refresh",
+		"right-click", "screen-next" };
+	for (size_t i = 0; i < sizeof no_exits / sizeof *no_exits; i++) {
+		checks++;
+		if (glassine_ga_is_exit(no_exits[i])) {
+			fails++;
+			printf("FAIL %s is not an exit\n", no_exits[i]);
+		}
+	}
+	/* no exit anywhere: top is show-bar, whatever its line; the others keep theirs */
+	static const char *const no_exit_file =
+		"3 left screen-next\n3 right screen-prev\n3 up fullscreen\n3 down nothing\n"
+		"4 left move-next\n4 right move-prev\n4 up refresh\n4 down close\n"
+		"2 tap right-click\n"
+		"edge top nothing\nedge bottom refresh\nedge left nothing\nedge right quick\n";
+	write_file(path, no_exit_file);
+	checks++;
+	if (glassine_ga_has_exit(path)) {
+		fails++;
+		printf("FAIL no-exit file has an exit\n");
+	}
+	eq("guard: top nothing -> show-bar", edge(path, "top"), "show-bar");
+	eq("guard: bottom kept", edge(path, "bottom"), "refresh");
+	eq("guard: right kept", edge(path, "right"), "quick");
+	eq("guard: left kept", edge(path, "left"), "nothing");
+	write_file(path, "edge top refresh\n");
+	eq("guard: top refresh, the defaults' minimize and home exit", edge(path, "top"), "refresh");
+	write_file(path, "edge top refresh\n3 down nothing\n4 up close\n");
+	eq("guard: top refresh, no exit left", edge(path, "top"), "show-bar");
+	/* the same with a later line giving one exit: no guard */
+	char text[1024];
+	static const char *const one_exit[] = { "3 down launcher\n", "2 tap home\n", "edge bottom show-bar\n",
+		"4 left overview\n", "edge right unfullscreen\n", "3 up minimize\n" };
+	for (size_t i = 0; i < sizeof one_exit / sizeof *one_exit; i++) {
+		snprintf(text, sizeof text, "%s%s", no_exit_file, one_exit[i]);
+		write_file(path, text);
+		char what[96];
+		snprintf(what, sizeof what, "no guard with %.*s", (int)strlen(one_exit[i]) - 1, one_exit[i]);
+		eq(what, edge(path, "top"), "nothing");
+	}
+	/* a commented-out exit does not count */
+	snprintf(text, sizeof text, "%s# 3 down minimize\n", no_exit_file);
+	write_file(path, text);
+	eq("guard: commented exit", edge(path, "top"), "show-bar");
+	/* the default file has exits (3 down minimize, 4 up home, edge top show-bar) */
+	checks++;
+	if (!glassine_ga_has_exit(NULL)) {
+		fails++;
+		printf("FAIL the defaults have no exit\n");
+	}
 
 	/* $HOME's file */
 	setenv("HOME", "/h", 1);
@@ -126,6 +214,7 @@ int main(int argc, char **argv) {
 	eq("overview", glassine_ga_global("overview"), "exec /usr/bin/glassine-shell toggle overview");
 	eq("quick", glassine_ga_global("quick"), "exec /usr/bin/glassine-shell toggle quick");
 	eq("notices", glassine_ga_global("notices"), "exec /usr/bin/glassine-shell toggle notices");
+	eq("show-bar", glassine_ga_global("show-bar"), "exec /usr/bin/glassine-shell bar show");
 	eq("screen-next", glassine_ga_global("screen-next"), "workspace next_on_output");
 	eq("screen-prev", glassine_ga_global("screen-prev"), "workspace prev_on_output");
 	eq("refresh", glassine_ga_global("refresh"), "exec /usr/bin/glassine-refresh");
@@ -146,11 +235,13 @@ int main(int argc, char **argv) {
 	full("unfullscreen", 0xabc, 0, 0, GLASSINE_GA_NOTHING, NULL);
 	full("unfullscreen", 0xabc, 0, 1, GLASSINE_GA_SWAY, "[con_id=2748] fullscreen disable");
 	full("maximize", 1, 0, 0, GLASSINE_GA_NOT_FULL_ACTION, NULL);
-	/* minimize: a swayd-full window back from full (not hidden); any other is cursor.c's */
+	/* minimize: a window an older swayd marked full, back from full (not hidden);
+	 * one not full screen is cursor.c's */
 	full("minimize", 0x5d, 1, 0, GLASSINE_GA_SWAYD, "full 5d");
 	full("minimize", 0x5d, 1, 1, GLASSINE_GA_SWAYD, "full 5d");
 	full("minimize", 1, 0, 0, GLASSINE_GA_NOT_FULL_ACTION, NULL);
-	full("minimize", 1, 0, 1, GLASSINE_GA_NOT_FULL_ACTION, NULL);
+	/* minimize of a window in sway's fullscreen (swayd's `full` now sets that): back from full */
+	full("minimize", 0x2a, 0, 1, GLASSINE_GA_SWAY, "[con_id=42] fullscreen disable");
 	full("home", 1, 0, 0, GLASSINE_GA_NOT_FULL_ACTION, NULL);
 
 	/* the socket path */
