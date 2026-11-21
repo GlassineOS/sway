@@ -50,6 +50,12 @@
  * erasure the app never gets). Where a region overlaps an area the app registered, the
  * region's rect wins (a stroke starting there is the region's). Layer surfaces and
  * input-method popups with regions ink as with areas.
+ * Version 4, the content hint (set_content): what the app says its next commit is, a
+ * new page or a step of a movement it drives. It is latched when that commit is applied
+ * and goes out with the next frame of the output the surface is on
+ * (glassine_ink_content_take, sway/desktop/output.c -> the glassine-epd backend's FRAME),
+ * with the surface's place in the frame's buffer; then it is gone. A surface that is
+ * not shown loses it.
  * Nothing happens when glassine-epdd-desktop isn't there (O_NONBLOCK open fails). */
 #include <ctype.h>
 #include <math.h>
@@ -129,6 +135,9 @@ struct ink_surf {
 	struct { uint32_t kind; float wmin, wmax, exp; struct ink_brush *obj; } br[2];     /* set_brush: tip, eraser (kind 0: unset); obj: set_brush_object */
 	/* res NULL: set by the glassine_ink command (discovered), else by the app */
 	struct wl_listener surface_destroy;
+	uint32_t content_next;          /* set_content: for the next commit */
+	uint32_t content;               /* latched at that commit, until the output's next frame takes it */
+	struct wl_listener surface_commit;
 };
 static struct wl_list ink_surfs;        /* ink_surf.link */
 static struct wl_event_source *ink_idle;
@@ -226,6 +235,7 @@ static void ink_surf_free(struct ink_surf *i)
 	brush_unuse(i->br[1].obj);
 	wl_list_remove(&i->link);
 	wl_list_remove(&i->surface_destroy.link);
+	wl_list_remove(&i->surface_commit.link);
 	pixman_region32_fini(&i->areas);
 	if (i->res) {
 		wl_resource_set_user_data(i->res, NULL);
@@ -238,6 +248,93 @@ static void handle_surface_destroy(struct wl_listener *l, void *data)
 {
 	struct ink_surf *i = wl_container_of(l, i, surface_destroy);
 	ink_surf_free(i);
+}
+
+/* the commit set_content was for is applied: its kind waits for the output's frame. A
+ * commit without one says nothing, and takes back what an older commit said, if no
+ * frame showed that one yet (the frame shows the newer picture) */
+static void handle_surface_commit(struct wl_listener *l, void *data)
+{
+	struct ink_surf *i = wl_container_of(l, i, surface_commit);
+	i->content = i->content_next;
+	i->content_next = 0;
+}
+
+static void surf_set_content(struct wl_client *c, struct wl_resource *res, uint32_t content)
+{
+	struct ink_surf *i = wl_resource_get_user_data(res);
+	if (!i) {
+		return;
+	}
+	i->content_next = content == GLASSINE_INK_SURFACE_V1_CONTENT_PAGE ||
+		content == GLASSINE_INK_SURFACE_V1_CONTENT_MOTION ? content : 0;
+}
+
+struct said { struct wlr_surface *s; struct wlr_box b; bool found; };
+
+static void said_find(struct wlr_scene_buffer *sb, int lx, int ly, void *data)
+{
+	struct said *f = data;
+	struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(sb);
+	if (f->found || !ss || ss->surface != f->s || !sb->buffer) {
+		return;
+	}
+	int bw = sb->dst_width, bh = sb->dst_height;
+	if (bw <= 0 || bh <= 0) {
+		bw = sb->buffer_width, bh = sb->buffer_height;
+		wlr_output_transform_coords(sb->transform, &bw, &bh);
+	}
+	f->b = (struct wlr_box){ lx, ly, bw, bh };
+	f->found = bw > 0 && bh > 0;
+}
+
+uint32_t glassine_ink_content_take(struct sway_output *output, struct wlr_box *box)
+{
+	uint32_t kind = 0;
+	struct wlr_box ob, un = { 0 };
+	wlr_output_layout_get_box(root->output_layout, output->wlr_output, &ob);
+	struct ink_surf *i;
+	wl_list_for_each(i, &ink_surfs, link) {
+		if (!i->content) {
+			continue;
+		}
+		struct said f = { .s = i->surface };
+		wlr_scene_node_for_each_buffer(&root->root_scene->tree.node, said_find, &f);
+		struct wlr_box in;
+		if (f.found && !wlr_box_intersection(&in, &f.b, &ob)) {
+			continue;       /* on another output: that one's frame takes it */
+		}
+		uint32_t k = i->content;
+		i->content = 0;         /* not shown at all: lost */
+		if (!f.found) {
+			continue;
+		}
+		/* several surfaces in one frame: a page wins (the frame is then exact), over the area of all */
+		if (!kind) {
+			un = in;
+		} else {
+			int x1 = un.x + un.width > in.x + in.width ? un.x + un.width : in.x + in.width;
+			int y1 = un.y + un.height > in.y + in.height ? un.y + un.height : in.y + in.height;
+			un.x = un.x < in.x ? un.x : in.x;
+			un.y = un.y < in.y ? un.y : in.y;
+			un.width = x1 - un.x, un.height = y1 - un.y;
+		}
+		if (!kind || k == GLASSINE_INK_SURFACE_V1_CONTENT_PAGE) {
+			kind = k;
+		}
+	}
+	if (!kind) {
+		return 0;
+	}
+	/* layout px -> the frame's buffer: the output's scale, then its transform undone */
+	float sc = output->wlr_output->scale;
+	int x0 = (int)floorf((un.x - ob.x) * sc), y0 = (int)floorf((un.y - ob.y) * sc);
+	int x1 = (int)ceilf((un.x - ob.x + un.width) * sc), y1 = (int)ceilf((un.y - ob.y + un.height) * sc);
+	struct wlr_box b = { x0, y0, x1 - x0, y1 - y0 };
+	int tw, th;
+	wlr_output_transformed_resolution(output->wlr_output, &tw, &th);
+	wlr_box_transform(box, &b, wlr_output_transform_invert(output->wlr_output->transform), tw, th);
+	return kind;
 }
 
 static void surf_set_areas(struct wl_client *c, struct wl_resource *res, struct wl_resource *region)
@@ -631,6 +728,7 @@ static const struct glassine_ink_surface_v1_interface surf_impl = {
 	.set_areas = surf_set_areas,
 	.set_brush = surf_set_brush,
 	.set_brush_object = surf_set_brush_object,
+	.set_content = surf_set_content,
 };
 
 static void surf_resource_destroy(struct wl_resource *res)
@@ -671,6 +769,8 @@ static void mgr_get_ink_surface(struct wl_client *c, struct wl_resource *res, ui
 	pixman_region32_init(&i->areas);
 	i->surface_destroy.notify = handle_surface_destroy;
 	wl_signal_add(&s->events.destroy, &i->surface_destroy);
+	i->surface_commit.notify = handle_surface_commit;
+	wl_signal_add(&s->events.commit, &i->surface_commit);
 	wl_list_insert(&ink_surfs, &i->link);
 }
 
@@ -743,6 +843,7 @@ struct cmd_results *cmd_glassine_ink(int argc, char **argv)
 		pixman_region32_init(&i->areas);
 		i->surface_destroy.notify = handle_surface_destroy;
 		wl_signal_add(&s->events.destroy, &i->surface_destroy);
+		wl_list_init(&i->surface_commit.link);  /* (discovered areas: nobody says what a commit is) */
 		wl_list_insert(&ink_surfs, &i->link);
 	}
 	pixman_region32_copy(&i->areas, &r);
@@ -756,7 +857,7 @@ void glassine_ink_init(struct wl_display *display)
 {
 	wl_list_init(&ink_surfs);
 	wl_list_init(&all_brushes);
-	wl_global_create(display, &glassine_ink_manager_v1_interface, 3, NULL, mgr_bind);     /* binds at the client's version (<= 3) */
+	wl_global_create(display, &glassine_ink_manager_v1_interface, 4, NULL, mgr_bind);     /* binds at the client's version (<= 4) */
 }
 struct walk { struct item it[MAXB]; int n; };
 
