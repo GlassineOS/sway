@@ -42,7 +42,14 @@
  * Only damage since the last true picture can hold a banded grey (band.pend).
  * band.quiet_ms after sway was last free to draw (the frame event: while
  * glassine-epdd-desktop holds a frame the quiet is not the apps') and did not, that region
- * goes through the pass without the band, as a FRAME marked TRUE. */
+ * goes through the pass without the band, as a FRAME marked TRUE.
+ * Content hints (GLASSINE_EPD_CAP_HINT): what an app said a commit of its
+ * surface is (glassine_ink_surface_v1.set_content) goes with the FRAME of the
+ * output commit that shows it: the kind in FRAME's stride, the surface's place
+ * as one more rect. Only that commit's own FRAME carries it, and only if its
+ * damage reaches into that place; the true frames, the whole-picture resends
+ * and a reconnect never do. A page frame goes through the pass without the
+ * band: its damage is the true picture at once and leaves band.pend. */
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
@@ -97,6 +104,8 @@ struct epd_output {
     struct wl_event_source *frame_timer;
     bool waiting;                       /* a frame is out: the frame event is pending */
     struct epd_buf *front;              /* the last committed buffer (resent on reconnect) */
+    uint32_t hint;                      /* glassine_epd_output_hint: for the commit under way */
+    struct wlr_box hint_box;
 };
 
 struct epd_backend {
@@ -143,6 +152,7 @@ struct epd_backend {
 
 static const struct wlr_backend_impl backend_impl;
 static const struct wlr_output_impl output_impl;
+static const struct wlr_output_impl output_impl_swcursor;
 
 /* ---- presentation ----------------------------------------------------------- */
 struct present_later { struct wlr_output *out; uint32_t commit_seq; bool presented; };
@@ -180,7 +190,7 @@ static void frame_now(struct epd_backend *be);
 static bool send_msg(struct epd_backend *be, const struct glassine_epd_msg *m, int fd)
 {
     if (be->fd < 0) return false;
-    size_t nr = m->type == GLASSINE_EPD_FRAME ? m->nrect : m->type == GLASSINE_EPD_CURSOR_IMG || m->type == GLASSINE_EPD_CURSOR_POS;
+    size_t nr = m->type == GLASSINE_EPD_FRAME ? m->nrect + (m->stride != 0) : m->type == GLASSINE_EPD_CURSOR_IMG || m->type == GLASSINE_EPD_CURSOR_POS;
     size_t len = offsetof(struct glassine_epd_msg, rect) + nr * sizeof m->rect[0];
     struct iovec iov = { (void *)m, len };
     union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } ctl;
@@ -240,14 +250,20 @@ static void lut_set(struct epd_backend *be, uint32_t tag, const uint8_t *lut);
 static void band_set(struct epd_backend *be, int t, int quiet_ms);
 
 /* a frame to glassine-epdd-desktop; nrect 0 = the whole buffer. Locks the buffer until DONE.
- * flags: FRAME's offset (GLASSINE_EPD_FRAME_TRUE). false: not sent (its present
- * event is sent as not presented) */
+ * flags: FRAME's offset (GLASSINE_EPD_FRAME_TRUE). hint: what the app said the frame is
+ * (GLASSINE_EPD_HINT_*, 0: nothing), where: its place, the rect after the damage (r must
+ * then leave room: n < GLASSINE_EPD_MAXRECT). false: not sent (its present event is sent
+ * as not presented) */
 static bool send_frame(struct epd_backend *be, struct epd_buf *eb, const struct glassine_epd_rect *r, int n,
-                       uint32_t commit_seq, uint32_t flags)
+                       uint32_t commit_seq, uint32_t flags, uint32_t hint, const struct wlr_box *where)
 {
     if (be->fd < 0 || (!eb->sent && !send_buf(be, eb))) { present(be, commit_seq, false); return false; }
     struct glassine_epd_msg m = { .type = GLASSINE_EPD_FRAME, .id = eb->id, .seq = ++be->seq, .nrect = n, .format = eb->tag, .offset = flags };
     memcpy(m.rect, r, n * sizeof *r);
+    if (hint && where && n < GLASSINE_EPD_MAXRECT) {
+        m.stride = hint;
+        m.rect[n] = (struct glassine_epd_rect){ where->x, where->y, where->width, where->height };
+    }
     if (!send_msg(be, &m, -1)) { present(be, commit_seq, false); return false; }
     wlr_buffer_lock(eb->b);
     be->locked[be->nlocked++] = (struct epd_locked){ eb, m.seq, commit_seq };
@@ -308,7 +324,7 @@ static void try_connect(struct epd_backend *be)
     /* (an older glassine-epdd-desktop ignores it); LUM: wlroots' grey shader writes luminance (GLASSINE_EPD_GREY_LUM, 0003) */
     const char *lum = getenv("GLASSINE_EPD_GREY_LUM");
     struct glassine_epd_msg hello = { .type = GLASSINE_EPD_HELLO,
-        .seq = GLASSINE_EPD_CAP_NEXT | (be->grey && lum && *lum && strcmp(lum, "0") ? GLASSINE_EPD_CAP_LUM : 0) |
+        .seq = GLASSINE_EPD_CAP_NEXT | GLASSINE_EPD_CAP_HINT | (be->grey && lum && *lum && strcmp(lum, "0") ? GLASSINE_EPD_CAP_LUM : 0) |
                (be->lut.on ? GLASSINE_EPD_CAP_GAMMA | GLASSINE_EPD_CAP_BAND : 0) };
     send_msg(be, &hello, -1);
     for (int i = 0; i < MAXBUF; i++) if (be->bufs[i].b) send_buf(be, &be->bufs[i]);
@@ -317,7 +333,7 @@ static void try_connect(struct epd_backend *be)
     /* (banded greys left in our last target: the true picture instead) */
     if (pixman_region32_not_empty(&be->band.pend) && lut_frame_whole(be)) return;
     if (be->out && be->out->front && be->out->base.enabled &&   /* the current picture, whole */
-        send_frame(be, be->out->front, NULL, 0, be->out->base.commit_seq, 0)) {
+        send_frame(be, be->out->front, NULL, 0, be->out->base.commit_seq, 0, 0, NULL)) {
         be->out->waiting = true;
         wl_event_source_timer_update(be->out->frame_timer, DONE_TIMEOUT_MS);
     }
@@ -479,7 +495,7 @@ static bool lut_frame_whole(struct epd_backend *be)
     if (!eb) return false;
     pixman_region32_clear(&be->band.pend);
     o->front = eb;
-    if (send_frame(be, eb, NULL, 0, o->base.commit_seq, 0)) {
+    if (send_frame(be, eb, NULL, 0, o->base.commit_seq, 0, 0, NULL)) {
         o->waiting = true;
         wl_event_source_timer_update(o->frame_timer, DONE_TIMEOUT_MS);
     }
@@ -522,7 +538,7 @@ static int band_quiet(void *data)
     struct glassine_epd_rect r[GLASSINE_EPD_MAXRECT];
     int n = region_rects(&be->band.pend, r);
     o->front = eb;
-    if (send_frame(be, eb, r, n, o->base.commit_seq, GLASSINE_EPD_FRAME_TRUE)) {
+    if (send_frame(be, eb, r, n, o->base.commit_seq, GLASSINE_EPD_FRAME_TRUE, 0, NULL)) {
         pixman_region32_clear(&be->band.pend);
         o->waiting = true;
         wl_event_source_timer_update(o->frame_timer, DONE_TIMEOUT_MS);
@@ -624,10 +640,34 @@ static bool output_test(struct wlr_output *wo, const struct wlr_output_state *st
     return true;
 }
 
+void glassine_epd_output_hint(struct wlr_output *wo, uint32_t kind, const struct wlr_box *box)
+{
+    if (wo->impl != &output_impl && wo->impl != &output_impl_swcursor) return;
+    struct epd_output *o = wl_container_of(wo, o, base);
+    o->hint = box && (kind == GLASSINE_EPD_HINT_PAGE || kind == GLASSINE_EPD_HINT_MOTION) ? kind : 0;
+    if (o->hint) o->hint_box = *box;
+}
+
+/* what the app said this commit is, if its damage reaches into the place said (no damage
+ * given: the whole buffer changed) */
+static uint32_t hint_for(struct epd_output *o, const struct wlr_output_state *st)
+{
+    uint32_t k = o->hint;
+    o->hint = 0;
+    if (!k || !(st->committed & WLR_OUTPUT_STATE_DAMAGE)) return k;
+    pixman_region32_t in;
+    pixman_region32_init(&in);
+    pixman_region32_intersect_rect(&in, (pixman_region32_t *)&st->damage, o->hint_box.x, o->hint_box.y, o->hint_box.width, o->hint_box.height);
+    if (!pixman_region32_not_empty(&in)) k = 0;
+    pixman_region32_fini(&in);
+    return k;
+}
+
 static bool output_commit(struct wlr_output *wo, const struct wlr_output_state *st)
 {
     struct epd_output *o = wl_container_of(wo, o, base);
     struct epd_backend *be = o->be;
+    uint32_t hint = o->hint ? hint_for(o, st) : 0;
     if (!output_test(wo, st)) return false;
     bool enabled = st->committed & WLR_OUTPUT_STATE_ENABLED ? st->enabled : wo->enabled;
     if (!enabled) {
@@ -648,9 +688,12 @@ static bool output_commit(struct wlr_output *wo, const struct wlr_output_state *
         if (st->committed & (WLR_OUTPUT_STATE_TRANSFORM | WLR_OUTPUT_STATE_SCALE | WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_ENABLED))
             band_accept(be, NULL);
         const pixman_region32_t *dmg = st->committed & WLR_OUTPUT_STATE_DAMAGE ? &st->damage : &all;
-        eb = lb = lut_pass(be, st->buffer, dmg, true);
+        /* a page (the app said so): no band, its damage is the true picture at once */
+        bool page = hint == GLASSINE_EPD_HINT_PAGE;
+        eb = lb = lut_pass(be, st->buffer, dmg, !page);
         if (be->band.t > 0) {           /* (a timer of the last gap: this frame ends it, frame_now arms the next) */
-            pixman_region32_union(&be->band.pend, &be->band.pend, dmg);
+            if (page && lb) pixman_region32_subtract(&be->band.pend, &be->band.pend, dmg);
+            else pixman_region32_union(&be->band.pend, &be->band.pend, dmg);
             wl_event_source_timer_update(be->band.timer, 0);
         }
         pixman_region32_fini(&all);
@@ -669,9 +712,14 @@ static bool output_commit(struct wlr_output *wo, const struct wlr_output_state *
             return true;
         }
         n = region_rects(&st->damage, r);
+        if (hint && n == GLASSINE_EPD_MAXRECT) {     /* (room for the hint's rect: the damage as its bounding box) */
+            const pixman_box32_t *e = pixman_region32_extents((pixman_region32_t *)&st->damage);
+            r[0] = (struct glassine_epd_rect){ e->x1, e->y1, e->x2 - e->x1, e->y2 - e->y1 };
+            n = 1;
+        }
     }
     o->waiting = true;
-    bool sent = be->fd >= 0 ? send_frame(be, eb, r, n, commit_seq, 0) : (present(be, commit_seq, false), false);
+    bool sent = be->fd >= 0 ? send_frame(be, eb, r, n, commit_seq, 0, hint, &o->hint_box) : (present(be, commit_seq, false), false);
     if (lb) wlr_buffer_unlock(lb->b);   /* (our acquire: locked by send_frame until DONE, or free again) */
     wl_event_source_timer_update(o->frame_timer, sent ? DONE_TIMEOUT_MS : NOCONSUMER_MS);
     return true;
