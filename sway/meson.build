@@ -15,6 +15,7 @@ sway_sources = files(
 	'glassine-ink-area.c',
 	'glassine-handwriting.c',
 	'glassine-handwriting-sway.c',
+	'glassine-output-density.c',
 	'epd-brush.c',
 	'sway_text_node.c',
 	'swaynag.c',
