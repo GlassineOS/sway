@@ -42,6 +42,24 @@ the strokes themselves are tested with `handwriting-standin.sh`: it builds
 stdin (the host's C compiler, libwayland-server, json-c), which GlassineOS/handwriting's
 tests run the service and the client library against.
 
+`handwriting-regions-test.sh` runs too (the host's C compiler, libwayland, json-c,
+wayland-scanner, python3): the writing regions of the pen interface's version 2 through the
+stand-in compositor, with `handwriting-regions-client.c` as the app and
+`handwriting-regions-service.py` as the service: the regions bit only for a version 2 manager,
+each stroke to the region it starts in (in its coordinates, also when it ends in another), the
+higher layer and then the newer region where they overlap, no stroke outside every region or
+outside a clip, a stroke dropped when its region is removed mid-stroke, raw strokes and no
+service traffic for a private region and a drawing region (reading off), no stroke in text mode,
+values with their word layout, set words and gone strokes, data parts over 2048 bytes, a scroll
+that sends the service nothing, a strike-through as the region's gesture, reports, stored ink
+handed back (numbers, value, state; strokes alone), the units from the output's px per mm, 40
+empty regions costing the service nothing, a region that becomes private forgotten and sending
+nothing more, the region's ink (also a stroke written while the service was away, in writing
+order) handed to a restarted service, and a service without regions getting no region op.
+
+`output-density-test.sh` runs too (the host's C compiler): the output key and the person's
+density file (`sway/glassine-output-density.c`).
+
 `shm-seal-test.sh` runs too (curl, patch and a C compiler): it builds wlroots' `util/shm.c`
 with our patches and checks that the pixman renderer's buffers take `F_SEAL_SHRINK`, as the
 panel daemon requires, and that the backend's memfds (the cursor) allow sealing.
