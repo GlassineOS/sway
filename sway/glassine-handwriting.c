@@ -108,6 +108,7 @@ struct hw_region {
 	struct held *held;              /* raw strokes the service has, for neat and a restart */
 	size_t nheld;
 	char *value, *state;            /* the last value's text, its saved state (base64) */
+	char *edit;                     /* an edit made while the service wasn't there */
 	struct wl_array in_text, in_state;      /* add_data gathered */
 	struct wl_array rp;             /* restore_points gathered */
 	struct held *rs;                /* restore_stroke gathered */
@@ -534,6 +535,13 @@ static bool region_up(void)
 	return H.fd >= 0 && H.up && H.regions;
 }
 
+/* a service that may read regions is running or on its way: writing in a region that wants
+ * it is held until it says hello, and handed to it then */
+static bool region_keep(const struct hw_region *r)
+{
+	return region_wants(r) && H.cmd && *H.cmd && H.fails < 5 && (!H.up || H.regions);
+}
+
 static void region_send_set(struct hw_region *r)
 {
 	json_object *m = rmsg("region_set", r);
@@ -563,8 +571,8 @@ static void region_forget(struct hw_region *r)
 	held_free(r->held, r->nheld);
 	r->held = NULL;
 	r->nheld = 0;
-	free(r->value); free(r->state);
-	r->value = r->state = NULL;
+	free(r->value); free(r->state); free(r->edit);
+	r->value = r->state = r->edit = NULL;
 }
 
 /* the region's announcement and choices, as they now stand: the service hears of a region
@@ -578,6 +586,7 @@ static void region_sync(struct hw_region *r)
 		return;
 	}
 	if (!r->announced) {
+		if (!region_wants(r)) region_forget(r);         /* private or off: nothing held is ever sent */
 		if (!r->holds || !region_wants(r) || !region_up()) return;
 		if (!r->obj->announced) send_surface(r->obj);
 		json_object *m = rmsg("region", r);
@@ -613,9 +622,18 @@ static json_object *restore_msg(struct hw_region *r, const struct held *h, size_
 /* after a new hello: the region's writing back to the restarted service */
 static void region_replay(struct hw_region *r)
 {
-	if (r->announced || !(r->nheld || r->value || r->state)) return;
+	if (!H.regions) { region_forget(r); return; }   /* this service doesn't read regions */
+	if (r->announced || !(r->nheld || r->value || r->state || r->edit)) return;
 	region_sync(r);
-	if (r->announced) svc_send(restore_msg(r, r->held, r->nheld, r->value, r->state));
+	if (!r->announced) return;
+	if (r->nheld || r->value || r->state) svc_send(restore_msg(r, r->held, r->nheld, r->value, r->state));
+	if (r->edit) {
+		json_object *m = rmsg("region_edit", r);
+		json_object_object_add(m, "text", json_object_new_string(r->edit));
+		svc_send(m);
+		free(r->edit);
+		r->edit = NULL;
+	}
 }
 
 static struct hw_region *region_of(json_object *m)
@@ -648,7 +666,9 @@ static void send_strokes(struct hw_region *r, json_object *m, const char *key, b
 			struct held *h = region_held(r, k[i]);
 			if (!h) continue;
 			wl_array_release(&h->pts);
-			*h = r->held[--r->nheld];
+			size_t at = (size_t)(h - r->held);
+			memmove(h, h + 1, (r->nheld - at - 1) * sizeof *h);
+			r->nheld--;
 		}
 	}
 	wl_array_release(&a);
@@ -904,7 +924,13 @@ static void svc_close(void)
 		wl_list_for_each(r, &o->regions, link) r->announced = false;
 	}
 	if (was) caps_changed();
-	if (!was && ++H.fails >= 5) return;     /* it can't start: raw strokes only, until the next login */
+	if (!was && ++H.fails >= 5) {           /* it can't start: raw strokes only, until the next login */
+		wl_list_for_each(o, &H.objs, link) {
+			struct hw_region *r;
+			wl_list_for_each(r, &o->regions, link) region_forget(r);
+		}
+		return;
+	}
 	if (!H.timer) H.timer = wl_event_loop_add_timer(H.loop, respawn, NULL);
 	if (H.timer) wl_event_source_timer_update(H.timer, RESPAWN_MS);
 }
@@ -1269,6 +1295,10 @@ static void r_edit(struct wl_client *c, struct wl_resource *res)
 		json_object *m = rmsg("region_edit", r);
 		json_object_object_add(m, "text", json_object_new_string(t));
 		svc_send(m);
+	} else if (region_keep(r)) {
+		free(r->edit);          /* the latest edit is the value */
+		r->edit = t;
+		return;
 	}
 	free(t);
 }
@@ -1343,11 +1373,11 @@ static void r_restore(struct wl_client *c, struct wl_resource *res)
 	if (!r->obj) { held_free(rs, nrs); free(value); free(state); return; }
 	r->holds = true;
 	region_now(r);
-	if (!r->announced) {            /* no service, or private: kept nowhere */
+	if (!r->announced && !region_keep(r)) {        /* no service, or private: kept nowhere */
 		held_free(rs, nrs); free(value); free(state);
 		return;
 	}
-	svc_send(restore_msg(r, rs, nrs, value, state));
+	if (r->announced) svc_send(restore_msg(r, rs, nrs, value, state));
 	region_forget(r);
 	r->held = rs;
 	r->nheld = nrs;
@@ -1580,7 +1610,7 @@ static void region_pen_up(struct hw_region *r)
 	glassine_handwriting_region_v1_send_stroke(r->res, k);
 	r->holds = true;
 	region_now(r);
-	if (!r->announced) return;
+	if (!r->announced && !region_keep(r)) return;
 	struct held *h = realloc(r->held, (r->nheld + 1) * sizeof *h);
 	if (h) {
 		r->held = h;
@@ -1589,6 +1619,7 @@ static void region_pen_up(struct hw_region *r)
 		wl_array_init(&h->pts);
 		wl_array_copy(&h->pts, &H.pts);
 	}
+	if (!r->announced) return;              /* held for the service's hello */
 	json_object *m = rmsg("region_stroke", r);
 	json_object_object_add(m, "k", json_object_new_int64(k));
 	json_object_object_add(m, "points", points_json(&H.pts));

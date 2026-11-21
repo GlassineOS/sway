@@ -52,8 +52,10 @@ outside a clip, a stroke dropped when its region is removed mid-stroke, raw stro
 service traffic for a private region and a drawing region (reading off), no stroke in text mode,
 values with their word layout, set words and gone strokes, data parts over 2048 bytes, a scroll
 that sends the service nothing, a strike-through as the region's gesture, reports, stored ink
-handed back (numbers, value, state; strokes alone), the region's ink handed to a restarted
-service, and a service without regions getting no region op.
+handed back (numbers, value, state; strokes alone), the units from the output's px per mm, 40
+empty regions costing the service nothing, a region that becomes private forgotten and sending
+nothing more, the region's ink (also a stroke written while the service was away, in writing
+order) handed to a restarted service, and a service without regions getting no region op.
 
 `output-density-test.sh` runs too (the host's C compiler): the output key and the person's
 density file (`sway/glassine-output-density.c`).

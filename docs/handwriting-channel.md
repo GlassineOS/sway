@@ -46,11 +46,15 @@ set word whose path doesn't parse.
 
 ## A service restart
 
-The compositor holds, per region the service had, the raw and restored strokes it sent (less
-those named in `gone`), the last value's text and the last state. After the service says
-hello again it sends `surface`, `region`, `region_set` and one `region_restore` with them, so
-the region's writing survives the restart without the app. It holds nothing for a private
-region, a drawing region (reading and neatening off) or before the service has the region.
+The compositor holds, per region that wants the service, its raw and restored strokes in
+writing order (less those named in `gone`), the last value's text and the last state; also
+what is written, restored or edited while the service is away (starting, or in the seconds
+before it is started again). After the service says hello it sends `surface`, `region`,
+`region_set`, one `region_restore` with them and then the held edit as `region_edit`, so the
+region's writing survives a restart without the app. It holds nothing for a private region
+(what it held is dropped when the region becomes private), a drawing region (reading and
+neatening off), with no service configured, once the service has failed to start five times,
+or when the service's hello has no `regions`.
 
 ## Units
 
