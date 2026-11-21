@@ -251,12 +251,15 @@ static void handle_surface_destroy(struct wl_listener *l, void *data)
 }
 
 /* the commit set_content was for is applied: its kind waits for the output's frame. A
- * commit without one says nothing, and takes back what an older commit said, if no
- * frame showed that one yet (the frame shows the newer picture) */
+ * commit without one that changes the picture says nothing, and takes back what an older
+ * commit said if no frame showed that one yet (the frame shows the newer picture); one
+ * that changes nothing (a frame callback asked for) leaves it */
 static void handle_surface_commit(struct wl_listener *l, void *data)
 {
 	struct ink_surf *i = wl_container_of(l, i, surface_commit);
-	i->content = i->content_next;
+	if (i->content_next || pixman_region32_not_empty(&i->surface->buffer_damage)) {
+		i->content = i->content_next;
+	}
 	i->content_next = 0;
 }
 
