@@ -334,6 +334,12 @@
       it covers another). A stroke still being written when its region is destroyed, or
       its object or surface goes, is dropped: no event is sent for it.
 
+      A region where it takes strokes is also an ink area of its surface (glassine_ink_v1):
+      the panel shows the pen's raw stroke there while it is written, as fast as in any ink
+      area, with the brush of the surface's ink object when the app set one. The app
+      registers nothing for it. A surface whose object is in region mode shows that preview
+      only there and in ink areas the app set itself.
+
       Strokes are numbered per region and never reused: live strokes from 0 up, each one
       above the highest number the region has used or been handed back (restore). Points are as in the
       protocol's description, in region coordinates, and come in points parts as there.

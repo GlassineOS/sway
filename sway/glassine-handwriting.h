@@ -15,7 +15,20 @@ struct glassine_hw_hooks {
 	void (*region_free)(void *region);
 	/* the region's bounding box: x0, y0, x1, y1 (optional) */
 	void (*region_box)(void *region, int box[4]);
+	/* where a surface's writing regions lie, or their modes, changed (optional): the ink
+	 * areas follow */
+	void (*regions_changed)(void);
 };
+
+/* a writing region for the ink areas: its rectangle (x, y, width, height, surface
+ * coordinates), its clip (a region_copy, NULL: the whole rectangle) and whether it takes
+ * strokes (ink mode; a text mode region takes none, also where it covers one below) */
+typedef void (*glassine_hw_region_cb)(void *data, const double rect[4], void *clip, bool ink);
+
+/* the surface's writing regions, topmost first (the order a stroke picks its region in;
+ * empty ones left out): false when the surface has none (its object, if any, isn't in
+ * region mode). cb NULL: only the answer. */
+bool glassine_hw_regions(struct wl_resource *surface, glassine_hw_region_cb cb, void *data);
 
 /* the glassine_handwriting_manager_v1 global; service: the program started for the
  * service's side (NULL or "": raw strokes only) */

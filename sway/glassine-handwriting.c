@@ -24,6 +24,11 @@
  * The raw strokes a region sent, its last value and saved state are kept here, so that a
  * restarted service gets them back (region_restore) without the app.
  *
+ * A region in ink mode is where the pen writes, so it is also an ink area of its surface:
+ * sway's ink areas (glassine-ink-area.c) ask for a surface's regions (glassine_hw_regions)
+ * and hear of every change to where they lie (the regions_changed hook), so the pen's raw
+ * ink shows under the pen there without the app registering anything else (spec 005).
+ *
  * This file uses libwayland-server, json-c and libc only (no wlroots types): sway's glue
  * (cursor.c, server.c) feeds it the pen's tool events and regions through hooks, and the
  * host test's stand-in compositor (test/handwriting-standin.c) does the same. */
@@ -149,6 +154,12 @@ static struct {
 
 static void svc_close(void);
 struct hw_region;
+
+/* where the regions lie changed: the ink areas follow */
+static void areas_changed(void)
+{
+	if (H.hooks.regions_changed) H.hooks.regions_changed();
+}
 static void region_replay(struct hw_region *r);
 
 static void svc_flush(void)
@@ -1020,6 +1031,7 @@ static void surface_gone(struct wl_listener *l, void *data)
 	wl_list_init(&o->surface_destroy.link);
 	o->surface = NULL;
 	if (H.cur == o) { H.cur = NULL; H.cur_r = NULL; wl_array_release(&H.pts); wl_array_init(&H.pts); }
+	if (o->region_mode) areas_changed();
 }
 
 static void set_area(struct wl_client *c, struct wl_resource *r, struct wl_resource *region)
@@ -1156,6 +1168,7 @@ static void region_detach(struct hw_region *r)
 		wl_list_remove(&r->link);
 		wl_list_init(&r->link);
 		r->obj = NULL;
+		areas_changed();
 	}
 }
 
@@ -1195,6 +1208,7 @@ static void r_set_rect(struct wl_client *c, struct wl_resource *res, wl_fixed_t 
 	bool resized = nw != r->w || nh != r->h;
 	r->w = nw;
 	r->h = nh;
+	areas_changed();
 	if (resized) region_changed(r, true);         /* a move alone: nothing for the service */
 }
 
@@ -1203,6 +1217,7 @@ static void r_set_clip(struct wl_client *c, struct wl_resource *res, struct wl_r
 	struct hw_region *r = region_from(res);
 	if (r->clip && H.hooks.region_free) H.hooks.region_free(r->clip);
 	r->clip = region && H.hooks.region_copy ? H.hooks.region_copy(region) : NULL;
+	areas_changed();
 }
 
 static void r_set_guides(struct wl_client *c, struct wl_resource *res, wl_fixed_t spacing, wl_fixed_t first)
@@ -1244,6 +1259,7 @@ static void r_set_neaten(struct wl_client *c, struct wl_resource *res, uint32_t 
 static void r_set_layer(struct wl_client *c, struct wl_resource *res, int32_t layer)
 {
 	region_from(res)->layer = layer;
+	areas_changed();
 }
 
 static void region_set_mode(struct hw_region *r, uint32_t mode)
@@ -1251,6 +1267,7 @@ static void region_set_mode(struct hw_region *r, uint32_t mode)
 	mode = mode == GLASSINE_HANDWRITING_V1_MODE_TEXT ? mode : GLASSINE_HANDWRITING_V1_MODE_INK;
 	if (mode == r->mode) return;
 	r->mode = mode;
+	areas_changed();
 	region_now(r);
 	if (!r->announced) return;
 	json_object *m = rmsg("region_mode", r);
@@ -1437,6 +1454,7 @@ static void get_region(struct wl_client *c, struct wl_resource *res, uint32_t id
 	wl_array_init(&r->rp);
 	wl_list_insert(o->regions.prev, &r->link);
 	wl_resource_set_implementation(r->res, &region_impl, r, region_resource_destroy);
+	areas_changed();
 }
 
 static void obj_set_mode(struct wl_client *c, struct wl_resource *res, uint32_t mode)
@@ -1537,6 +1555,44 @@ void glassine_hw_set_per_mm(double per_mm)
 	}
 }
 
+/* the object that takes the surface's strokes (as glassine_hw_pen_down picks it) */
+static struct hw_obj *obj_on(struct wl_resource *surface)
+{
+	struct hw_obj *o, *hit = NULL;
+	if (!surface) return NULL;
+	wl_list_for_each(o, &H.objs, link) if (o->surface == surface) hit = o;
+	return hit;
+}
+
+static int region_above(const void *a, const void *b)
+{
+	const struct hw_region *x = *(struct hw_region *const *)a, *y = *(struct hw_region *const *)b;
+	if (x->layer != y->layer) return x->layer > y->layer ? -1 : 1;
+	return x->seq > y->seq ? -1 : x->seq < y->seq ? 1 : 0;
+}
+
+bool glassine_hw_regions(struct wl_resource *surface, glassine_hw_region_cb cb, void *data)
+{
+	struct hw_obj *o = obj_on(surface);
+	if (!o || !o->region_mode) return false;
+	if (!cb) return true;
+	size_t n = 0, k = 0;
+	struct hw_region *r, **all;
+	wl_list_for_each(r, &o->regions, link) n++;
+	if (!n) return true;
+	if (!(all = malloc(n * sizeof *all))) return true;
+	wl_list_for_each(r, &o->regions, link) all[k++] = r;
+	qsort(all, n, sizeof *all, region_above);
+	for (k = 0; k < n; k++) {
+		r = all[k];
+		if (r->w <= 0 || r->h <= 0) continue;
+		const double rect[4] = { r->x, r->y, r->w, r->h };
+		cb(data, rect, r->clip, r->mode == GLASSINE_HANDWRITING_V1_MODE_INK);
+	}
+	free(all);
+	return true;
+}
+
 void glassine_hw_axis(double pressure, double tilt_x, double tilt_y)
 {
 	if (!isnan(pressure)) H.pressure = pressure;
@@ -1562,8 +1618,7 @@ bool glassine_hw_pen_down(struct wl_resource *surface, double sx, double sy, dou
 {
 	glassine_hw_pen_up(t);
 	if (!surface) return false;
-	struct hw_obj *o, *hit = NULL;
-	wl_list_for_each(o, &H.objs, link) if (o->surface == surface) hit = o;
+	struct hw_obj *hit = obj_on(surface);
 	if (!hit) return false;
 	struct hw_region *top = NULL;
 	if (hit->region_mode) {

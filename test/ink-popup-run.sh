@@ -22,6 +22,11 @@
 #     by a keyboard-like layer's exclusive zone: the popup lies
 #     over the window's top; the zone goes (the window grows), the popup
 #     commits (ink): it stays where it was, and the next press reaches it
+# 10  writing regions (ink-region-client.c, a window without ink areas of its
+#     own): a region in ink mode is an ink area (S 1, a brush with the eraser
+#     off), nothing else of the window is; it follows a move without a new
+#     frame, its clip, a text mode region above it cuts it, text mode and
+#     destroy take it away, the app's own areas add to it, many regions fit
 set -eu
 apk add -q build-base meson ninja pkgconf basu-dev cairo-dev eudev-dev gdk-pixbuf-dev json-c-dev libevdev-dev \
     libinput-dev libxkbcommon-dev linux-pam-dev pango-dev pcre2-dev wayland-dev wayland-protocols curl \
@@ -46,12 +51,16 @@ WP=/usr/share/wayland-protocols
 for x in $WP/stable/xdg-shell/xdg-shell.xml $WP/unstable/text-input/text-input-unstable-v3.xml \
         subprojects/wlroots/protocol/input-method-unstable-v2.xml \
         subprojects/wlroots/protocol/wlr-virtual-pointer-unstable-v1.xml \
-        protocols/wlr-layer-shell-unstable-v1.xml protocols/glassine-ink-v1.xml; do
+        protocols/wlr-layer-shell-unstable-v1.xml protocols/glassine-ink-v1.xml \
+        protocols/glassine-handwriting-v1.xml; do
     n=$(basename "$x" .xml)
     wayland-scanner client-header "$x" $G/$n-client-protocol.h
     wayland-scanner private-code "$x" $G/$n-protocol.c
 done
-gcc -std=c11 -O2 -Wall -Werror -I$G -o /tmp/client test/ink-popup-client.c $G/*-protocol.c -lwayland-client
+gcc -std=c11 -O2 -Wall -Werror -I$G -o /tmp/client test/ink-popup-client.c $(ls $G/*-protocol.c | grep -v handwriting) \
+    -lwayland-client
+gcc -std=c11 -O2 -Wall -Werror -I$G -o /tmp/rclient test/ink-region-client.c $G/xdg-shell-protocol.c \
+    $G/glassine-ink-v1-protocol.c $G/glassine-handwriting-v1-protocol.c -lwayland-client
 
 export XDG_RUNTIME_DIR=/tmp/rt
 mkdir -p -m 700 $XDG_RUNTIME_DIR
@@ -60,7 +69,7 @@ rm -f $F /out/*.log
 mkfifo $F
 cat 0<>$F >/out/ink-fifo.log &      # read-write: the FIFO always has a reader
 printf "output HEADLESS-1 mode 800x600 scale 2\ndefault_border none\n" >/tmp/sway.conf
-WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 $SWAY -c /tmp/sway.conf -d >/out/sway.log 2>&1 &
+GLASSINE_HANDWRITING_SERVICE= WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 $SWAY -c /tmp/sway.conf -d >/out/sway.log 2>&1 &
 SW=$!
 i=0
 while [ ! -S $XDG_RUNTIME_DIR/wayland-1 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
@@ -70,9 +79,11 @@ CL=$!
 exec 3>/tmp/cmd
 
 FAIL=0
+RC=
 finish() {
     exec 3>&-
-    kill $CL $SW 2>/dev/null || true
+    exec 4>&- 2>/dev/null || true
+    kill $CL $RC $SW 2>/dev/null || true
     chown -R "$HOST_UID" /out
     if [ $FAIL -eq 0 ]; then echo "ink-popup: all cases passed"; else echo "ink-popup: FAILED"; fi
     exit $FAIL
@@ -255,4 +266,69 @@ send "up"
 wait_new "^ptr-button popup3 up"
 if tail -n +$((MARK + 1)) /out/client.log | grep -q "^ptr-button popup3 down"; then echo "ok: 9 the next press reaches the popup"; else echo "FAIL: 9 the next press missed the popup"; FAIL=1; fi
 if tail -n +$((MARK + 1)) /out/client.log | grep -q "^ti-leave\|^im-deactivate"; then echo "FAIL: 9 the field lost the focus"; FAIL=1; else echo "ok: 9 the field keeps the focus"; fi
+
+# 10: writing regions. The first client goes (its window, popups and layers with it);
+# the region client's window then has all of the output: 400x300 layout = 800x600 panel
+exec 3>&-
+kill $CL 2>/dev/null || true
+mkfifo /tmp/rcmd
+WAYLAND_DISPLAY=wayland-1 /tmp/rclient </tmp/rcmd >/out/rclient.log 2>&1 &
+RC=$!
+exec 4>/tmp/rcmd
+rwait() {
+    i=0
+    while ! grep -q -- "$1" /out/rclient.log; do
+        i=$((i + 1))
+        if [ $i -gt 50 ]; then echo "FAIL: no '$1' from the region client"; FAIL=1; tail -5 /out/rclient.log; finish; fi
+        sleep 0.1
+    done
+}
+rsend() {
+    echo "$1" >&4
+    rwait "^ok $1\$"
+}
+# the number of APP's rect lines in the last block (with a brush or without)
+lines() {
+    block | awk -v app="$1" '$1 == "ink" && $2 == "r" { if ($9 == app) n++; next }
+        $1 == "ink" && $2 != "brush" && $7 == app { n++ } END { print n + 0 }'
+}
+rwait "^ready"
+rsend "win 400 300"
+expect ink-test 0 "10 the first client's window is gone"
+rsend "commit"
+expect_line "^ink 0 0 0 800 600 ink-region\$" "10 no region yet: the whole window, S 0 (inks only with ink=on)"
+rsend "r 0 10 10 100 50"
+expect ink-region 20000 "10 a region in ink mode: an ink area, alone"
+expect_line "^ink r [0-9]* 1 20 20 200 100 ink-region\$" "10 its rect, S 1, at the region"
+expect_line "^ink brush [0-9]* 0 0.00 0.00 1.000 1 0.00 0.00 1.000\$" "10 the regions' brush: the app's tip, the eraser off"
+rsend "r 0 50 60 100 50"
+expect_line "^ink r [0-9]* 1 100 120 200 100 ink-region\$" "10 a move without a new frame: the rect follows"
+rsend "clip 0 50 60 50 50"
+expect ink-region 10000 "10 its clip"
+rsend "clip 0 none"
+expect ink-region 20000 "10 no clip: the whole rectangle"
+rsend "r 1 50 60 50 25"
+rsend "layer 1 1"
+rsend "mode 1 text"
+expect ink-region 15000 "10 a text mode region above cuts it"
+rsend "mode 1 ink"
+expect ink-region 20000 "10 both in ink mode: their union"
+rsend "layer 1 -1"
+rsend "mode 1 text"
+expect ink-region 20000 "10 a text mode region below cuts nothing"
+rsend "all text"
+expect ink-region 0 "10 every region in text mode: no ink"
+rsend "all ink"
+expect ink-region 20000 "10 back in ink mode"
+rsend "kill 0"
+rsend "kill 1"
+expect ink-region 0 "10 regions destroyed: no ink (the surface stays in region mode)"
+rsend "r 2 10 10 100 50"
+rsend "inkarea 300 0 100 100"
+expect ink-region 60000 "10 the app's own areas add to the regions"
+rsend "kill 2"
+expect ink-region 40000 "10 the app's areas alone"
+rsend "many 40"
+expect ink-region 72000 "10 40 more regions: all inked"
+[ "$(lines ink-region)" = 41 ] && echo "ok: 10 41 rects sent" || { echo "FAIL: 10 $(lines ink-region) rects, expected 41"; FAIL=1; }
 finish
