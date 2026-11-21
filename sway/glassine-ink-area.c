@@ -29,6 +29,16 @@
  * default: without areas of their own (or with null areas) they only cover.
  * APP: the layer surface's namespace, "input-method" for a popup. Menus
  * (xdg popups) always only cover.
+ * Writing regions (glassine_handwriting_v1 version 2, glassine-handwriting.c) are ink
+ * areas too: a region in ink mode is where the pen writes, so its rectangle and clip, less
+ * every region stacked above it that is in text mode, join its surface's areas as the
+ * app's own (S 1), whether reading is on or off and whether the field is private. A
+ * surface in region mode inks only in its regions (and areas it registered itself), never
+ * in the rest of its window: a stroke starting outside every region isn't delivered. The
+ * region's rects carry the surface's brush when its client set one, else a brush with the
+ * eraser end off (sway gives handwriting no eraser strokes, so the panel would show an
+ * erasure the app never gets). Layer surfaces and input-method popups with regions ink
+ * as with areas.
  * Nothing happens when glassine-epdd-desktop isn't there (O_NONBLOCK open fails). */
 #include <ctype.h>
 #include <math.h>
@@ -57,6 +67,7 @@
 #include "sway/server.h"
 #include "sway/tree/root.h"
 #include "sway/tree/view.h"
+#include "glassine-handwriting.h"
 #include "glassine-ink-area.h"
 #include "glassine-ink-v1-protocol.h"
 #include "epd-brush.h"
@@ -126,6 +137,11 @@ static void update_soon(void)
 	}
 }
 
+void glassine_ink_changed(void)
+{
+	update_soon();
+}
+
 static struct ink_surf *ink_surf_for(struct wlr_surface *s)
 {
 	struct ink_surf *i;
@@ -137,10 +153,58 @@ static struct ink_surf *ink_surf_for(struct wlr_surface *s)
 	return NULL;
 }
 
+/* a surface's writing regions: what of them takes strokes, topmost first */
+struct hw_acc { pixman_region32_t ink, taken; };
+
+static void hw_region(void *data, const double rect[4], void *clip, bool ink)
+{
+	struct hw_acc *h = data;
+	int x0 = (int)floor(rect[0]), y0 = (int)floor(rect[1]);
+	int x1 = (int)ceil(rect[0] + rect[2]), y1 = (int)ceil(rect[1] + rect[3]);
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	pixman_region32_t a;
+	pixman_region32_init_rect(&a, x0, y0, x1 - x0, y1 - y0);
+	if (clip) {
+		pixman_region32_intersect(&a, &a, clip);
+	}
+	if (ink) {
+		pixman_region32_t f;
+		pixman_region32_init(&f);
+		pixman_region32_subtract(&f, &a, &h->taken);
+		pixman_region32_union(&h->ink, &h->ink, &f);
+		pixman_region32_fini(&f);
+	}
+	pixman_region32_union(&h->taken, &h->taken, &a);
+	pixman_region32_fini(&a);
+}
+
+/* the surface's writing regions in ink mode into out (surface coordinates, initialised
+ * by the caller): false when it has no regions */
+static bool hw_areas(struct wlr_surface *s, pixman_region32_t *out)
+{
+	struct hw_acc h;
+	pixman_region32_init(&h.ink);
+	pixman_region32_init(&h.taken);
+	bool on = s && s->resource && glassine_hw_regions(s->resource, hw_region, &h);
+	pixman_region32_copy(out, &h.ink);
+	pixman_region32_fini(&h.ink);
+	pixman_region32_fini(&h.taken);
+	return on;
+}
+
 bool glassine_ink_has_areas(struct wlr_surface *s)
 {
 	struct ink_surf *i = s ? ink_surf_for(s) : NULL;
-	return i && i->set && pixman_region32_not_empty(&i->areas);
+	if (i && i->set && pixman_region32_not_empty(&i->areas)) {
+		return true;
+	}
+	pixman_region32_t r;
+	pixman_region32_init(&r);
+	bool on = hw_areas(s, &r) && pixman_region32_not_empty(&r);
+	pixman_region32_fini(&r);
+	return on;
 }
 
 static void brush_unuse(struct ink_brush *b);
@@ -705,6 +769,13 @@ static struct sway_view *view_of(struct wlr_scene_node *n)
  * input-method popup or a layer surface (an xdg popup's root is itself) and
  * its client set areas on it or a subsurface; else NULL (it only covers, and
  * takes none of the MAXV slots) */
+static void has_regions(struct wlr_surface *s, int sx, int sy, void *data)
+{
+	if (s->resource && glassine_hw_regions(s->resource, NULL, NULL)) {
+		*(bool *)data = true;
+	}
+}
+
 static struct wlr_surface *owner_of(struct wlr_surface *s)
 {
 	struct wlr_surface *r = s ? wlr_surface_get_root_surface(s) : NULL;
@@ -718,7 +789,9 @@ static struct wlr_surface *owner_of(struct wlr_surface *s)
 			return r;
 		}
 	}
-	return NULL;
+	bool hw = false;        /* writing regions on it or a subsurface */
+	wlr_surface_for_each_surface(r, has_regions, &hw);
+	return hw ? r : NULL;
 }
 
 static void collect(struct wlr_scene_buffer *sb, int lx, int ly, void *data)
@@ -818,8 +891,8 @@ void glassine_ink_update(struct sway_output *output)
 	struct sway_view *vs[MAXV];     /* the windows, or NULL: */
 	struct wlr_surface *os[MAXV];   /* a view-less owner (popup, layer surface) */
 	struct ink_surf *bs[MAXV];      /* the window's brush (an ink_surf with set_brush) */
-	pixman_region32_t vis[MAXV], sdk[MAXV], occl;
-	bool has_sdk[MAXV];
+	pixman_region32_t vis[MAXV], sdk[MAXV], hwa[MAXV], occl;
+	bool has_sdk[MAXV], has_hw[MAXV];
 	int nv = 0;
 	pixman_region32_init_rect(&occl, 0, 0, 0, 0);
 	for (int i = w.n - 1; i >= 0; i--) {                /* top to bottom */
@@ -836,8 +909,10 @@ void glassine_ink_update(struct sway_output *output)
 				vs[nv] = w.it[i].v;
 				os[nv] = w.it[i].own;
 				has_sdk[nv] = false;
+				has_hw[nv] = false;
 				bs[nv] = NULL;
 				pixman_region32_init(&sdk[nv]);
+				pixman_region32_init(&hwa[nv]);
 				pixman_region32_init(&vis[nv++]);
 			}
 			if (k < nv) {
@@ -861,6 +936,15 @@ void glassine_ink_update(struct sway_output *output)
 					pixman_region32_fini(&a);
 					has_sdk[k] = true;
 				}
+				/* its writing regions in ink mode, from the same origin */
+				pixman_region32_t a;
+				pixman_region32_init(&a);
+				if (w.it[i].s && hw_areas(w.it[i].s, &a)) {
+					pixman_region32_translate(&a, w.it[i].ox, w.it[i].oy);
+					pixman_region32_union(&hwa[k], &hwa[k], &a);
+					has_hw[k] = true;
+				}
+				pixman_region32_fini(&a);
 			}
 		}
 		pixman_region32_union_rect(&occl, &occl, b.x, b.y, b.width, b.height);
@@ -868,9 +952,13 @@ void glassine_ink_update(struct sway_output *output)
 	pixman_region32_fini(&occl);
 
 	char msg[MSG];
-	int n = snprintf(msg, sizeof msg, "ink begin\n"), nb = 0, bk[MAXV];
+	int n = snprintf(msg, sizeof msg, "ink begin\n"), nb = 0, bk[MAXV], hb = 0;
 	for (int k = 0; k < nv; k++) {              /* the brushes first: widths x the output scale */
 		bk[k] = 0;
+		if (has_hw[k]) {
+			has_sdk[k] = true;      /* a surface in region mode inks only in its areas */
+			pixman_region32_subtract(&hwa[k], &hwa[k], &sdk[k]);
+		}
 		if (bs[k] && (vs[k] || has_sdk[k]) && n < (int)sizeof msg - 400) {
 			bk[k] = ++nb;
 			unsigned kind[2];
@@ -885,12 +973,19 @@ void glassine_ink_update(struct sway_output *output)
 				kind[1], bs[k]->br[1].wmin * sc, bs[k]->br[1].wmax * sc, bs[k]->br[1].exp,
 				id[0] ? " tip=" : "", id[0] ? id[0] : "", id[1] ? " rub=" : "", id[1] ? id[1] : "");
 		}
+		if (has_hw[k] && !bk[k] && !hb && n < (int)sizeof msg - 400) {
+			/* the regions' brush without one of the surface's: the tip as the app's
+			 * profile has it (kind 0), the eraser end off (kind 1) */
+			hb = ++nb;
+			n += snprintf(msg + n, sizeof msg - n, "ink brush %d 0 0.00 0.00 1.000 1 0.00 0.00 1.000\n", hb);
+		}
 	}
 	for (int k = 0; k < nv; k++) {
 		char app[128], line[MSG];
 		int ln = 0, nr;
 		if (!vs[k] && !has_sdk[k]) {    /* a popup or layer surface without areas: covers only */
 			pixman_region32_fini(&sdk[k]);
+			pixman_region32_fini(&hwa[k]);
 			pixman_region32_fini(&vis[k]);
 			continue;
 		}
@@ -899,26 +994,36 @@ void glassine_ink_update(struct sway_output *output)
 		} else {
 			owner_name(os[k], app, sizeof app);
 		}
+		/* the regions' part (not already the app's areas) with their brush, then the rest */
+		pixman_region32_t hv;
+		pixman_region32_init(&hv);
+		pixman_region32_intersect(&hv, &vis[k], &hwa[k]);
+		pixman_region32_fini(&hwa[k]);
 		if (has_sdk[k]) {
 			pixman_region32_intersect(&vis[k], &vis[k], &sdk[k]);
 		}
 		pixman_region32_fini(&sdk[k]);
-		pixman_box32_t *r = pixman_region32_rectangles(&vis[k], &nr);
-		for (int j = 0; j < nr && ln < (int)sizeof line - 200; j++) {
-			int b[4] = { (int)((r[j].x1 - ob.x) * sc), (int)((r[j].y1 - ob.y) * sc),
-				(int)((r[j].x2 - r[j].x1) * sc + 0.999), (int)((r[j].y2 - r[j].y1) * sc + 0.999) }, o[4];
-			switch (rot) {          /* back to portrait px (glassine-popup-hint.c) */
-			case 270: o[0] = b[1]; o[1] = ow - b[0] - b[2]; o[2] = b[3]; o[3] = b[2]; break;
-			case 90: o[0] = oh - b[1] - b[3]; o[1] = b[0]; o[2] = b[3]; o[3] = b[2]; break;
-			case 180: o[0] = ow - b[0] - b[2]; o[1] = oh - b[1] - b[3]; o[2] = b[2]; o[3] = b[3]; break;
-			default: memcpy(o, b, sizeof o);
-			}
-			if (bk[k]) {            /* (the plain form without a brush: an older glassine-epdd-desktop still reads it) */
-				ln += snprintf(line + ln, sizeof line - ln, "ink r %d %d %d %d %d %d %s\n", bk[k], has_sdk[k], o[0], o[1], o[2], o[3], app);
-			} else {
-				ln += snprintf(line + ln, sizeof line - ln, "ink %d %d %d %d %d %s\n", has_sdk[k], o[0], o[1], o[2], o[3], app);
+		for (int pass = 0; pass < 2; pass++) {
+			pixman_region32_t *rg = pass ? &hv : &vis[k];
+			int kb = pass && !bk[k] ? hb : bk[k];
+			pixman_box32_t *r = pixman_region32_rectangles(rg, &nr);
+			for (int j = 0; j < nr && ln < (int)sizeof line - 200; j++) {
+				int b[4] = { (int)((r[j].x1 - ob.x) * sc), (int)((r[j].y1 - ob.y) * sc),
+					(int)((r[j].x2 - r[j].x1) * sc + 0.999), (int)((r[j].y2 - r[j].y1) * sc + 0.999) }, o[4];
+				switch (rot) {          /* back to portrait px (glassine-popup-hint.c) */
+				case 270: o[0] = b[1]; o[1] = ow - b[0] - b[2]; o[2] = b[3]; o[3] = b[2]; break;
+				case 90: o[0] = oh - b[1] - b[3]; o[1] = b[0]; o[2] = b[3]; o[3] = b[2]; break;
+				case 180: o[0] = ow - b[0] - b[2]; o[1] = oh - b[1] - b[3]; o[2] = b[2]; o[3] = b[3]; break;
+				default: memcpy(o, b, sizeof o);
+				}
+				if (kb) {               /* (the plain form without a brush: an older glassine-epdd-desktop still reads it) */
+					ln += snprintf(line + ln, sizeof line - ln, "ink r %d %d %d %d %d %d %s\n", kb, has_sdk[k], o[0], o[1], o[2], o[3], app);
+				} else {
+					ln += snprintf(line + ln, sizeof line - ln, "ink %d %d %d %d %d %s\n", has_sdk[k], o[0], o[1], o[2], o[3], app);
+				}
 			}
 		}
+		pixman_region32_fini(&hv);
 		pixman_region32_fini(&vis[k]);
 		/* a window whose rects don't fit is left out (no ink there), never cut */
 		if (n + ln < (int)sizeof msg - 16) {

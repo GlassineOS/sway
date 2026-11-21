@@ -1,8 +1,9 @@
 /* glassine-handwriting-sway.c — sway's side of the pen interface (glassine-handwriting.c):
- * the identity from the security context, wl_region contents, the output's px per mm, and
- * the tablet tool's events. A stroke starts where the tip touches a surface with a
- * handwriting object and ends where it lifts, also when sway sends the app emulated pointer
- * events instead of tablet ones. The eraser end writes nothing here.
+ * the identity from the security context, wl_region contents, the output's px per mm, the
+ * tablet tool's events, and the ink areas told when the writing regions change. A stroke
+ * starts where the tip touches a surface with a handwriting object and ends where it lifts,
+ * also when sway sends the app emulated pointer events instead of tablet ones. The eraser
+ * end writes nothing here.
  *
  * The ink's units: the logical px per mm of the output the pen writes on, from its physical
  * size, else from the person's density for that output (glassine-output-density.h, kept by
@@ -28,6 +29,7 @@
 #include "sway/tree/root.h"
 #include "glassine-handwriting.h"
 #include "glassine-handwriting-sway.h"
+#include "glassine-ink-area.h"
 #include "glassine-output-density.h"
 
 static void identify(struct wl_client *client, char *buf, size_t size)
@@ -72,6 +74,7 @@ void glassine_hw_sway_init(struct wl_display *display)
 	static const struct glassine_hw_hooks hooks = {
 		.identify = identify, .region_copy = region_copy, .region_contains = region_contains,
 		.region_free = region_free, .region_box = region_box,
+		.regions_changed = glassine_ink_changed,       /* the regions are ink areas */
 	};
 	const char *cmd = getenv("GLASSINE_HANDWRITING_SERVICE");
 	glassine_hw_init(display, &hooks, cmd ? cmd : "glassine-handwriting-service");

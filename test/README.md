@@ -29,7 +29,10 @@ the rest of the sequence is swallowed). The touch glue in `sway/input/cursor.c` 
 and checks the ink lines sway writes to the panel daemon's FIFO: a popup's areas at its
 position, cut by what is above it and cutting what is below, following it when it moves and
 gone when it unmaps; a layer surface's areas; and that the pointer's press and drag reach
-the popup without moving focus. SWAY: a `build-glassine.sh` binary for the host's
+the popup without moving focus. Then `ink-region-client.c` (a window with writing regions and
+no ink areas of its own): each region in ink mode is an ink area, following a move without a
+new frame, its clip, text mode regions above it, its destruction, the app's own areas and
+many regions at once. SWAY: a `build-glassine.sh` binary for the host's
 architecture (as in CI); without it the container builds this tree. Logs go to
 `build-test/ink-popup/`.
 
