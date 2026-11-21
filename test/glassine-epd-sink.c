@@ -9,6 +9,8 @@
  * -g GAMMA: after HELLO, a gamma table for its GPU (LUT; 1: the identity)
  * -b T: after HELLO, the dead band's T (BAND), -q QUIET_MS its gap (default 125)
  * -c FRAMES:T: after that many frames, T changes
+ * Per frame a LEN line (the message's bytes, nrect, stride) and, for a frame an app said
+ * something about (FRAME's stride), a SAID line: the kind and where (content-hint-test.sh).
  * R8 frames: mapped dma-bufs (waits for their write fences); per frame a BAND line:
  * its tag, true marker, 5 samples along the middle row, FNV-1a of all its bytes;
  * DIR/last.pgm is the newest one */
@@ -150,6 +152,7 @@ int main(int argc, char **argv)
             struct glassine_epd_msg m;
             union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr a; } ctl;
             struct iovec iov = { &m, sizeof m };
+            memset(&m, 0, sizeof m);
             struct msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl.b, .msg_controllen = sizeof ctl.b };
             ssize_t n = recvmsg(fd, &mh, 0);
             if (n <= 0) { printf("glassine-epd-sink: backend gone\n"); break; }
@@ -191,6 +194,11 @@ int main(int argc, char **argv)
                        m.nrect ? "" : " (whole)", now_ms() - last_done);
                 for (uint32_t k = 0; k < m.nrect && k < 4; k++)
                     printf("  %dx%d+%d+%d\n", m.rect[k].w, m.rect[k].h, m.rect[k].x, m.rect[k].y);
+                /* the content hint (FRAME's stride, the rect after the damage) and the message's size */
+                printf("  LEN seq=%u bytes=%zd nrect=%u stride=%u\n", m.seq, n, m.nrect, m.stride);
+                if (m.stride && m.nrect < GLASSINE_EPD_MAXRECT)
+                    printf("  SAID seq=%u kind=%u at=%dx%d+%d+%d\n", m.seq, m.stride, m.rect[m.nrect].w, m.rect[m.nrect].h,
+                           m.rect[m.nrect].x, m.rect[m.nrect].y);
                 if (i >= 0 && bufs[i].format == FOURCC_R8) r8_frame(&m, i, dir, now_ms(), now_ms() - last_done);
                 else if (i >= 0 && dir) {
                     char name[64];

@@ -36,6 +36,7 @@
 #include "sway/tree/view.h"
 #include "sway/tree/workspace.h"
 #include "../glassine-ink-area.h"
+#include "../glassine-epd-backend.h"
 
 #if WLR_HAS_DRM_BACKEND
 #include <wlr/backend/drm.h>
@@ -318,6 +319,9 @@ static int output_repaint_timer_handler(void *data) {
 	struct wlr_scene_output *scene_output = output->scene_output;
 	if (!wlr_output->needs_frame && !output->gamma_lut_changed &&
 			!pixman_region32_not_empty(&scene_output->pending_commit_damage)) {
+		/* Glassine: what an app said about a commit that changed nothing here is void */
+		struct wlr_box none;
+		glassine_ink_content_take(output, &none);
 		return 0;
 	}
 
@@ -354,7 +358,13 @@ static int output_repaint_timer_handler(void *data) {
 		}
 	}
 
-	if (!wlr_output_commit_state(output->wlr_output, &pending)) {
+	/* Glassine: what the apps said this frame is (a page, a step of a movement) goes with it */
+	struct wlr_box glassine_said_box;
+	uint32_t glassine_said = glassine_ink_content_take(output, &glassine_said_box);
+	glassine_epd_output_hint(output->wlr_output, glassine_said, &glassine_said_box);
+	bool glassine_committed = wlr_output_commit_state(output->wlr_output, &pending);
+	glassine_epd_output_hint(output->wlr_output, 0, NULL);
+	if (!glassine_committed) {
 		sway_log(SWAY_ERROR, "Page-flip failed on output %s", output->wlr_output->name);
 	} else {
 		/* Glassine: the pen's ink areas for glassine-epdd-desktop (the windows' visible regions) */

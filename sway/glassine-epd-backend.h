@@ -15,6 +15,12 @@ bool glassine_epd_backend_is(struct wlr_backend *backend);
  * after the renderer exists and before the backend starts: decides the grey
  * output (GLASSINE_EPD_GREY=1, a GLES renderer with R8 LINEAR render targets) */
 void glassine_epd_backend_renderer(struct wlr_backend *backend, void *renderer);
+/* what the apps said the output's next frame is (the ink protocol's set_content, kind =
+ * GLASSINE_EPD_HINT_*; 0, or box NULL: nothing), box in the frame buffer's coordinates.
+ * Set right before the output's commit, cleared after it: it goes out with that commit's
+ * FRAME if its damage reaches into box. A page frame skips the dead band */
+struct wlr_box;
+void glassine_epd_output_hint(struct wlr_output *output, uint32_t kind, const struct wlr_box *box);
 /* the output is grey: sway renders R8 with *transform */
 struct wlr_output;
 bool glassine_epd_output_grey(struct wlr_output *output, enum wl_output_transform *transform);
