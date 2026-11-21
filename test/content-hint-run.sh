@@ -22,10 +22,10 @@ apk add -q build-base meson ninja pkgconf basu-dev cairo-dev eudev-dev gdk-pixbu
 cp -r /s /tmp/t
 cd /tmp/t
 rm -rf build subprojects out-arm64 build-test
+WLR=$(sh wlroots/setup.sh /tmp/t)      # (also installs what the binary needs to run)
 if [ -e /sway-bin ]; then
     SWAY=/sway-bin
 else
-    WLR=$(sh wlroots/setup.sh /tmp/t)
     # shellcheck disable=SC2086
     meson setup -Dsd-bus-provider=basu -Dman-pages=disabled -Dswaybar=false -Dswaynag=false $WLR build >/dev/null
     ninja -C build sway/sway >/tmp/ninja.log 2>&1 || { tail -30 /tmp/ninja.log; exit 1; }
@@ -100,6 +100,7 @@ cases() {
     run $T "$2" 4
     i=0
     while ! grep -q "^ready" /out/client-$T.log && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    grep -q "^ready" /out/client-$T.log || { bad "$T: the client did not start"; tail -5 /out/sway-$T.log /out/client-$T.log; chown -R "$HOST_UID" /out; exit 1; }
     grep -q "^ink version 4" /out/client-$T.log && ok "$T: the ink global is version 4" || bad "$T: the ink global's version: $(grep 'ink version' /out/client-$T.log)"
     send $T "win 100 60"
     caps=$(awk '/^HELLO/ { print $3 }' $L | tail -1)
