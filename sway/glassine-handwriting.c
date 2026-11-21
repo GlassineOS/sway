@@ -27,7 +27,9 @@
  * A region in ink mode is where the pen writes, so it is also an ink area of its surface:
  * sway's ink areas (glassine-ink-area.c) ask for a surface's regions (glassine_hw_regions)
  * and hear of every change to where they lie (the regions_changed hook), so the pen's raw
- * ink shows under the pen there without the app registering anything else (spec 005).
+ * ink shows under the pen there without the app registering anything else (spec 005). The
+ * panel daemon applies the same start rule: a stroke a region takes inks over the visible
+ * window, past the region's edge; one starting outside every region doesn't ink.
  *
  * This file uses libwayland-server, json-c and libc only (no wlroots types): sway's glue
  * (cursor.c, server.c) feeds it the pen's tool events and regions through hooks, and the
