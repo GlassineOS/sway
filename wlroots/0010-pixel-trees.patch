@@ -1,0 +1,802 @@
+Subject: [PATCH] glassine: pixel trees, whole scales for whole-scale-only clients,
+ no scaling by one pixel
+
+An e-ink panel needs sharp pixels: no client buffer may be resampled.
+
+- A scene tree can be a pixel tree (wlr_scene_tree_set_pixel_units): the
+  positions and sizes below it count in units of n whole pixels of an output
+  of a given scale, from the output pixel the tree's own layout position
+  rounds to. A buffer of n pixels per unit is then drawn pixel for pixel
+  wherever it sits in the tree, which whole layout coordinates cannot say at
+  a fractional scale. Towards the rest of the scene the nodes have layout
+  boxes rounded outwards (visibility, damage, box tests) and opaque regions
+  rounded inwards; wlr_scene_node_at gives positions in units. A pixel tree
+  can be clipped in output pixels (wlr_scene_tree_set_pixel_clip) and is
+  never scanned out directly.
+- At a fractional output scale, and below a pixel tree, a buffer whose size
+  is within one pixel of its box in output pixels is drawn one to one with
+  the nearest filter: a pixel too many is cut, a pixel too few repeats the
+  last row or column.
+- wl_output.scale and the preferred buffer scale of a surface without a
+  fractional scale object are the nearest whole number to the output's scale
+  (at least 1), not the next one up; below a pixel tree the tree's n. A
+  surface with a fractional scale object keeps the next whole number up.
+  wlr_fractional_scale_v1_surface_has_object tells the two apart.
+- wlr_scene_node_for_each_buffer gives layout positions below a pixel tree;
+  wlr_scene_node_get_layout_size gives a node's layout size.
+
+At a whole output scale without pixel trees nothing changes.
+
+diff --git a/include/wlr/types/wlr_fractional_scale_v1.h b/include/wlr/types/wlr_fractional_scale_v1.h
+index 9126360..53ea4e6 100644
+--- a/include/wlr/types/wlr_fractional_scale_v1.h
++++ b/include/wlr/types/wlr_fractional_scale_v1.h
+@@ -9,6 +9,7 @@
+ #ifndef WLR_TYPES_WLR_FRACTIONAL_SCALE_V1_H
+ #define WLR_TYPES_WLR_FRACTIONAL_SCALE_V1_H
+ 
++#include <stdbool.h>
+ #include <wayland-server-core.h>
+ 
+ struct wlr_surface;
+@@ -28,6 +29,20 @@ struct wlr_fractional_scale_manager_v1 {
+ void wlr_fractional_scale_v1_notify_scale(
+ 		struct wlr_surface *surface, double scale);
+ 
++/**
++ * Glassine: whether the client made a wp_fractional_scale_v1 object for the
++ * surface.
++ */
++bool wlr_fractional_scale_v1_surface_has_object(struct wlr_surface *surface);
++
++/**
++ * Glassine: the whole buffer scale to prefer for a surface on an output of the
++ * given scale: for a surface with a fractional scale object the next whole
++ * number up, for any other the nearest whole number, at least 1 (such a surface
++ * is shown pixel for pixel at it or scaled the least).
++ */
++int32_t wlr_fractional_scale_v1_whole_scale(struct wlr_surface *surface, double scale);
++
+ struct wlr_fractional_scale_manager_v1 *wlr_fractional_scale_manager_v1_create(
+ 		struct wl_display *display, uint32_t version);
+ 
+diff --git a/include/wlr/types/wlr_scene.h b/include/wlr/types/wlr_scene.h
+index a8fc215..b7f97e9 100644
+--- a/include/wlr/types/wlr_scene.h
++++ b/include/wlr/types/wlr_scene.h
+@@ -90,6 +90,11 @@ struct wlr_scene_tree {
+ 	struct wlr_scene_node node;
+ 
+ 	struct wl_list children; // wlr_scene_node.link
++
++	/* Glassine: a pixel tree, see wlr_scene_tree_set_pixel_units(); px_n 0: an
++	 * ordinary tree */
++	int px_n, px_den;
++	int px_clip_width, px_clip_height;
+ };
+ 
+ /** The root scene-graph node. */
+@@ -323,6 +328,43 @@ void wlr_scene_set_linux_dmabuf_v1(struct wlr_scene *scene,
+  */
+ struct wlr_scene_tree *wlr_scene_tree_create(struct wlr_scene_tree *parent);
+ 
++/**
++ * Glassine: make a tree a pixel tree (n > 0) or an ordinary one (n 0).
++ *
++ * The positions and sizes of everything below a pixel tree count in units of n
++ * whole pixels of an output of the given scale (which is taken in 120ths), from
++ * the output pixel the tree's own layout position rounds to. So a buffer of n
++ * pixels per unit is drawn pixel for pixel on such an output, wherever it sits
++ * in the tree, which layout coordinates cannot say at a fractional scale.
++ *
++ * Towards the rest of the scene the nodes below have layout boxes: the smallest
++ * box of whole layout pixels around their pixels (visibility, damage, the box
++ * tests), while their opaque regions are rounded inwards. wlr_scene_node_at()
++ * gives positions on them in units, wlr_scene_node_coords() the layout position
++ * rounded down. On an output of another scale the units are scaled.
++ */
++void wlr_scene_tree_set_pixel_units(struct wlr_scene_tree *tree, int n, float scale);
++
++/**
++ * Glassine: clip everything below a pixel tree to width x height output pixels
++ * from the tree's origin (0: no clip). Only applies on an output of the tree's
++ * scale.
++ */
++void wlr_scene_tree_set_pixel_clip(struct wlr_scene_tree *tree, int width, int height);
++
++/**
++ * Glassine: the pixel tree a node is in (NULL: none) and the node's position
++ * in it, in units.
++ */
++struct wlr_scene_tree *wlr_scene_node_pixel_tree(struct wlr_scene_node *node,
++	int *ux, int *uy);
++
++/**
++ * Glassine: the size of a rect or buffer node in layout px (below a pixel tree:
++ * of its layout box).
++ */
++void wlr_scene_node_get_layout_size(struct wlr_scene_node *node, int *width, int *height);
++
+ /**
+  * Add a node displaying a single surface to the scene-graph.
+  *
+diff --git a/types/output/output.c b/types/output/output.c
+index 818f454..18bb811 100644
+--- a/types/output/output.c
++++ b/types/output/output.c
+@@ -49,7 +49,10 @@ static void send_scale(struct wl_resource *resource) {
+ 	struct wlr_output *output = wlr_output_from_resource(resource);
+ 	uint32_t version = wl_resource_get_version(resource);
+ 	if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
+-		wl_output_send_scale(resource, (uint32_t)ceil(output->scale));
++		/* Glassine: the nearest whole scale, not the next one up: a client that
++		 * takes only whole scales is shown pixel for pixel at it */
++		double nearest = floor(output->scale + 0.5);
++		wl_output_send_scale(resource, (uint32_t)(nearest < 1 ? 1 : nearest));
+ 	}
+ }
+ 
+diff --git a/types/scene/surface.c b/types/scene/surface.c
+index 1905b4d..bbee6b3 100644
+--- a/types/scene/surface.c
++++ b/types/scene/surface.c
+@@ -18,7 +18,10 @@ static void handle_scene_buffer_outputs_update(
+ 	}
+ 	double scale = surface->buffer->primary_output->output->scale;
+ 	wlr_fractional_scale_v1_notify_scale(surface->surface, scale);
+-	wlr_surface_set_preferred_buffer_scale(surface->surface, ceil(scale));
++	int ux, uy;
++	struct wlr_scene_tree *px = wlr_scene_node_pixel_tree(&surface->buffer->node, &ux, &uy);
++	wlr_surface_set_preferred_buffer_scale(surface->surface, px != NULL ? px->px_n :
++		wlr_fractional_scale_v1_whole_scale(surface->surface, scale));
+ 	wlr_surface_set_preferred_buffer_transform(surface->surface,
+ 		surface->buffer->primary_output->output->transform);
+ }
+diff --git a/types/scene/wlr_scene.c b/types/scene/wlr_scene.c
+index 7b97ca3..5a2168d 100644
+--- a/types/scene/wlr_scene.c
++++ b/types/scene/wlr_scene.c
+@@ -1,4 +1,5 @@
+ #include <assert.h>
++#include <math.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <wlr/backend.h>
+@@ -191,11 +192,125 @@ struct wlr_scene_tree *wlr_scene_tree_create(struct wlr_scene_tree *parent) {
+ 
+ static void scene_node_get_size(struct wlr_scene_node *node, int *lx, int *ly);
+ 
++/* Glassine: pixel trees (wlr_scene_tree_set_pixel_units) */
++
++static void scene_node_get_raw_size(struct wlr_scene_node *node, int *width, int *height);
++static void scene_node_update(struct wlr_scene_node *node, pixman_region32_t *damage);
++static void scene_node_visibility(struct wlr_scene_node *node, pixman_region32_t *visible);
++
++static struct wlr_scene_tree *scene_node_px(struct wlr_scene_node *node, int *ux, int *uy) {
++	int x = 0, y = 0;
++	while (node->parent != NULL) {
++		x += node->x;
++		y += node->y;
++		if (node->parent->px_n > 0) {
++			*ux = x;
++			*uy = y;
++			return node->parent;
++		}
++		node = &node->parent->node;
++	}
++	return NULL;
++}
++
++struct wlr_scene_tree *wlr_scene_node_pixel_tree(struct wlr_scene_node *node,
++		int *ux, int *uy) {
++	return scene_node_px(node, ux, uy);
++}
++
++static int px_div_floor(int64_t a, int64_t b) {
++	int64_t q = a / b;
++	if (a % b != 0 && (a < 0) != (b < 0)) {
++		q--;
++	}
++	return (int)q;
++}
++
++/* a units coordinate in layout px from the tree's origin, rounded down / up */
++static int px_lo(const struct wlr_scene_tree *tree, int u) {
++	return px_div_floor((int64_t)u * tree->px_n * 120, tree->px_den);
++}
++
++static int px_hi(const struct wlr_scene_tree *tree, int u) {
++	return -px_div_floor(-(int64_t)u * tree->px_n * 120, tree->px_den);
++}
++
++static bool px_scale_matches(const struct wlr_scene_tree *tree, float scale) {
++	return (int)lroundf(scale * 120) == tree->px_den;
++}
++
++/* The box in output pixels (before the output's transform), on an output of the
++ * given scale at layout ox, oy, of a units box of a pixel tree at layout ax, ay.
++ * True: the output has the tree's scale, a unit is px_n whole pixels. */
++static bool px_dev_box(const struct wlr_scene_tree *tree, int ax, int ay,
++		const struct wlr_box *units, int ox, int oy, float scale, struct wlr_box *dev) {
++	if (px_scale_matches(tree, scale)) {
++		dev->x = (int)round((ax - ox) * scale) + units->x * tree->px_n;
++		dev->y = (int)round((ay - oy) * scale) + units->y * tree->px_n;
++		dev->width = units->width * tree->px_n;
++		dev->height = units->height * tree->px_n;
++		return true;
++	}
++	double k = (double)tree->px_n * 120 / tree->px_den;
++	double x0 = ax - ox + units->x * k, y0 = ay - oy + units->y * k;
++	dev->x = (int)round(x0 * scale);
++	dev->y = (int)round(y0 * scale);
++	dev->width = (int)round((x0 + units->width * k) * scale) - dev->x;
++	dev->height = (int)round((y0 + units->height * k) * scale) - dev->y;
++	return false;
++}
++
++void wlr_scene_tree_set_pixel_units(struct wlr_scene_tree *tree, int n, float scale) {
++	int den = n > 0 ? (int)lroundf(scale * 120) : 0;
++	if (den <= 0) {
++		n = den = 0;
++	}
++	if (tree->px_n == n && tree->px_den == den) {
++		return;
++	}
++
++	int x, y;
++	pixman_region32_t visible;
++	pixman_region32_init(&visible);
++	if (wlr_scene_node_coords(&tree->node, &x, &y)) {
++		scene_node_visibility(&tree->node, &visible);
++	}
++
++	tree->px_n = n;
++	tree->px_den = den;
++	if (n == 0) {
++		tree->px_clip_width = tree->px_clip_height = 0;
++	}
++	scene_node_update(&tree->node, &visible);
++}
++
++void wlr_scene_tree_set_pixel_clip(struct wlr_scene_tree *tree, int width, int height) {
++	if (width <= 0 || height <= 0) {
++		width = height = 0;
++	}
++	if (tree->px_clip_width == width && tree->px_clip_height == height) {
++		return;
++	}
++	tree->px_clip_width = width;
++	tree->px_clip_height = height;
++	scene_node_update(&tree->node, NULL);
++}
++
++/* a child's layout position: below a pixel tree (px) it cannot be summed up */
++static void scene_child_coords(struct wlr_scene_node *child, bool px,
++		int lx, int ly, int *cx, int *cy) {
++	*cx = lx + child->x;
++	*cy = ly + child->y;
++	if (px) {
++		wlr_scene_node_coords(child, cx, cy);
++	}
++}
++
+ typedef bool (*scene_node_box_iterator_func_t)(struct wlr_scene_node *node,
+ 	int sx, int sy, void *data);
+ 
+ static bool _scene_nodes_in_box(struct wlr_scene_node *node, struct wlr_box *box,
+-		scene_node_box_iterator_func_t iterator, void *user_data, int lx, int ly) {
++		scene_node_box_iterator_func_t iterator, void *user_data, int lx, int ly, bool px) {
+ 	if (!node->enabled) {
+ 		return false;
+ 	}
+@@ -204,8 +319,11 @@ static bool _scene_nodes_in_box(struct wlr_scene_node *node, struct wlr_box *box
+ 	case WLR_SCENE_NODE_TREE:;
+ 		struct wlr_scene_tree *scene_tree = wlr_scene_tree_from_node(node);
+ 		struct wlr_scene_node *child;
++		bool child_px = px || scene_tree->px_n > 0;
+ 		wl_list_for_each_reverse(child, &scene_tree->children, link) {
+-			if (_scene_nodes_in_box(child, box, iterator, user_data, lx + child->x, ly + child->y)) {
++			int cx, cy;
++			scene_child_coords(child, child_px, lx, ly, &cx, &cy);
++			if (_scene_nodes_in_box(child, box, iterator, user_data, cx, cy, child_px)) {
+ 				return true;
+ 			}
+ 		}
+@@ -230,11 +348,24 @@ static bool scene_nodes_in_box(struct wlr_scene_node *node, struct wlr_box *box,
+ 	int x, y;
+ 	wlr_scene_node_coords(node, &x, &y);
+ 
+-	return _scene_nodes_in_box(node, box, iterator, user_data, x, y);
++	int ux, uy;
++	return _scene_nodes_in_box(node, box, iterator, user_data, x, y,
++		scene_node_px(node, &ux, &uy) != NULL);
+ }
+ 
++static void scene_node_px_opaque_region(struct wlr_scene_node *node,
++		struct wlr_scene_tree *tree, int ux, int uy, int x, int y,
++		pixman_region32_t *opaque);
++
+ static void scene_node_opaque_region(struct wlr_scene_node *node, int x, int y,
+ 		pixman_region32_t *opaque) {
++	int ux, uy;
++	struct wlr_scene_tree *px_tree = scene_node_px(node, &ux, &uy);
++	if (px_tree != NULL) {
++		scene_node_px_opaque_region(node, px_tree, ux, uy, x, y, opaque);
++		return;
++	}
++
+ 	int width, height;
+ 	scene_node_get_size(node, &width, &height);
+ 
+@@ -266,6 +397,44 @@ static void scene_node_opaque_region(struct wlr_scene_node *node, int x, int y,
+ 	pixman_region32_init_rect(opaque, x, y, width, height);
+ }
+ 
++/* a node below a pixel tree: its opaque region in units, then each rectangle's
++ * edges rounded inwards to whole layout px; x, y: the node's layout position */
++static void scene_node_px_opaque_region(struct wlr_scene_node *node,
++		struct wlr_scene_tree *tree, int ux, int uy, int x, int y,
++		pixman_region32_t *opaque) {
++	int width, height;
++	scene_node_get_raw_size(node, &width, &height);
++
++	pixman_region32_t units;
++	pixman_region32_init_rect(&units, 0, 0, width, height);
++	if (node->type == WLR_SCENE_NODE_RECT) {
++		struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
++		if (scene_rect->color[3] != 1) {
++			pixman_region32_clear(&units);
++		}
++	} else if (node->type == WLR_SCENE_NODE_BUFFER) {
++		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
++		if (!scene_buffer->buffer || scene_buffer->opacity != 1) {
++			pixman_region32_clear(&units);
++		} else if (!scene_buffer->buffer_is_opaque) {
++			pixman_region32_intersect(&units, &units, &scene_buffer->opaque_region);
++		}
++	}
++
++	int x0 = px_lo(tree, ux), y0 = px_lo(tree, uy);
++	pixman_region32_clear(opaque);
++	int nrects;
++	pixman_box32_t *rects = pixman_region32_rectangles(&units, &nrects);
++	for (int i = 0; i < nrects; i++) {
++		int x1 = px_hi(tree, ux + rects[i].x1) - x0, x2 = px_lo(tree, ux + rects[i].x2) - x0;
++		int y1 = px_hi(tree, uy + rects[i].y1) - y0, y2 = px_lo(tree, uy + rects[i].y2) - y0;
++		if (x2 > x1 && y2 > y1) {
++			pixman_region32_union_rect(opaque, opaque, x + x1, y + y1, x2 - x1, y2 - y1);
++		}
++	}
++	pixman_region32_fini(&units);
++}
++
+ struct scene_update_data {
+ 	pixman_region32_t *visible;
+ 	pixman_region32_t *update_region;
+@@ -521,8 +690,8 @@ static void scene_node_visibility(struct wlr_scene_node *node,
+ 	pixman_region32_union(visible, visible, &node->visible);
+ }
+ 
+-static void scene_node_bounds(struct wlr_scene_node *node,
+-		int x, int y, pixman_region32_t *visible) {
++static void scene_node_bounds_px(struct wlr_scene_node *node,
++		int x, int y, pixman_region32_t *visible, bool px) {
+ 	if (!node->enabled) {
+ 		return;
+ 	}
+@@ -530,8 +699,11 @@ static void scene_node_bounds(struct wlr_scene_node *node,
+ 	if (node->type == WLR_SCENE_NODE_TREE) {
+ 		struct wlr_scene_tree *scene_tree = wlr_scene_tree_from_node(node);
+ 		struct wlr_scene_node *child;
++		bool child_px = px || scene_tree->px_n > 0;
+ 		wl_list_for_each(child, &scene_tree->children, link) {
+-			scene_node_bounds(child, x + child->x, y + child->y, visible);
++			int cx, cy;
++			scene_child_coords(child, child_px, x, y, &cx, &cy);
++			scene_node_bounds_px(child, cx, cy, visible, child_px);
+ 		}
+ 		return;
+ 	}
+@@ -541,6 +713,12 @@ static void scene_node_bounds(struct wlr_scene_node *node,
+ 	pixman_region32_union_rect(visible, visible, x, y, width, height);
+ }
+ 
++static void scene_node_bounds(struct wlr_scene_node *node,
++		int x, int y, pixman_region32_t *visible) {
++	int ux, uy;
++	scene_node_bounds_px(node, x, y, visible, scene_node_px(node, &ux, &uy) != NULL);
++}
++
+ static void scene_update_region(struct wlr_scene *scene,
+ 		pixman_region32_t *update_region) {
+ 	pixman_region32_t visible;
+@@ -796,6 +974,47 @@ void wlr_scene_buffer_set_buffer_with_damage(struct wlr_scene_buffer *scene_buff
+ 
+ 	struct wlr_scene *scene = scene_node_get_root(&scene_buffer->node);
+ 	struct wlr_scene_output *scene_output;
++
++	int ux, uy;
++	struct wlr_scene_tree *px_tree = scene_node_px(&scene_buffer->node, &ux, &uy);
++	if (px_tree != NULL) {
++		/* below a pixel tree: the damage lands on the node's box in output pixels */
++		int ax, ay;
++		wlr_scene_node_coords(&px_tree->node, &ax, &ay);
++		struct wlr_box units = { .x = ux, .y = uy };
++		scene_node_get_raw_size(&scene_buffer->node, &units.width, &units.height);
++		wl_list_for_each(scene_output, &scene->outputs, link) {
++			float output_scale = scene_output->output->scale;
++			struct wlr_box dev;
++			px_dev_box(px_tree, ax, ay, &units, scene_output->x, scene_output->y,
++				output_scale, &dev);
++			float sx = dev.width / box.width, sy = dev.height / box.height;
++
++			pixman_region32_t output_damage;
++			pixman_region32_init(&output_damage);
++			wlr_region_scale_xy(&output_damage, &trans_damage, sx, sy);
++			if (sx != 1 || sy != 1) {
++				wlr_region_expand(&output_damage, &output_damage,
++					(int)ceilf((sx > sy ? sx : sy) / 2.0f) + 1);
++			}
++			pixman_region32_translate(&output_damage, dev.x, dev.y);
++
++			pixman_region32_t cull_region;
++			pixman_region32_init(&cull_region);
++			pixman_region32_copy(&cull_region, &scene_buffer->node.visible);
++			pixman_region32_translate(&cull_region, -scene_output->x, -scene_output->y);
++			scale_output_damage(&cull_region, output_scale);
++			pixman_region32_intersect(&output_damage, &output_damage, &cull_region);
++			pixman_region32_fini(&cull_region);
++
++			scene_output_damage(scene_output, &output_damage);
++			pixman_region32_fini(&output_damage);
++		}
++		pixman_region32_fini(&trans_damage);
++		pixman_region32_fini(&fallback_damage);
++		return;
++	}
++
+ 	wl_list_for_each(scene_output, &scene->outputs, link) {
+ 		float output_scale = scene_output->output->scale;
+ 		float output_scale_x = output_scale * scale_x;
+@@ -955,6 +1174,19 @@ static struct wlr_texture *scene_buffer_get_texture(
+ 
+ static void scene_node_get_size(struct wlr_scene_node *node,
+ 		int *width, int *height) {
++	scene_node_get_raw_size(node, width, height);
++
++	/* below a pixel tree: the layout box around the node's pixels */
++	int ux, uy;
++	struct wlr_scene_tree *px_tree = scene_node_px(node, &ux, &uy);
++	if (px_tree != NULL && *width > 0 && *height > 0) {
++		*width = px_hi(px_tree, ux + *width) - px_lo(px_tree, ux);
++		*height = px_hi(px_tree, uy + *height) - px_lo(px_tree, uy);
++	}
++}
++
++static void scene_node_get_raw_size(struct wlr_scene_node *node,
++		int *width, int *height) {
+ 	*width = 0;
+ 	*height = 0;
+ 
+@@ -1105,6 +1337,11 @@ bool wlr_scene_node_coords(struct wlr_scene_node *node,
+ 			break;
+ 		}
+ 
++		if (node->parent->px_n > 0) {
++			/* units of a pixel tree so far: layout px from here on */
++			lx = px_lo(node->parent, lx);
++			ly = px_lo(node->parent, ly);
++		}
+ 		node = &node->parent->node;
+ 	}
+ 
+@@ -1114,8 +1351,8 @@ bool wlr_scene_node_coords(struct wlr_scene_node *node,
+ }
+ 
+ static void scene_node_for_each_scene_buffer(struct wlr_scene_node *node,
+-		int lx, int ly, wlr_scene_buffer_iterator_func_t user_iterator,
+-		void *user_data) {
++		struct wlr_scene_node *start, int lx, int ly,
++		wlr_scene_buffer_iterator_func_t user_iterator, void *user_data) {
+ 	if (!node->enabled) {
+ 		return;
+ 	}
+@@ -1125,19 +1362,33 @@ static void scene_node_for_each_scene_buffer(struct wlr_scene_node *node,
+ 
+ 	if (node->type == WLR_SCENE_NODE_BUFFER) {
+ 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
++		int ux, uy;
++		if (scene_node_px(node, &ux, &uy) != NULL) {
++			/* below a pixel tree: its layout position, from the start node's
++			 * parent as the sums are */
++			int sx, sy;
++			wlr_scene_node_coords(node, &lx, &ly);
++			wlr_scene_node_coords(start, &sx, &sy);
++			lx -= sx - start->x;
++			ly -= sy - start->y;
++		}
+ 		user_iterator(scene_buffer, lx, ly, user_data);
+ 	} else if (node->type == WLR_SCENE_NODE_TREE) {
+ 		struct wlr_scene_tree *scene_tree = wlr_scene_tree_from_node(node);
+ 		struct wlr_scene_node *child;
+ 		wl_list_for_each(child, &scene_tree->children, link) {
+-			scene_node_for_each_scene_buffer(child, lx, ly, user_iterator, user_data);
++			scene_node_for_each_scene_buffer(child, start, lx, ly, user_iterator, user_data);
+ 		}
+ 	}
+ }
+ 
+ void wlr_scene_node_for_each_buffer(struct wlr_scene_node *node,
+ 		wlr_scene_buffer_iterator_func_t user_iterator, void *user_data) {
+-	scene_node_for_each_scene_buffer(node, 0, 0, user_iterator, user_data);
++	scene_node_for_each_scene_buffer(node, node, 0, 0, user_iterator, user_data);
++}
++
++void wlr_scene_node_get_layout_size(struct wlr_scene_node *node, int *width, int *height) {
++	scene_node_get_size(node, width, height);
+ }
+ 
+ struct node_at_data {
+@@ -1153,6 +1404,36 @@ static bool scene_node_at_iterator(struct wlr_scene_node *node,
+ 	double rx = at_data->lx - lx;
+ 	double ry = at_data->ly - ly;
+ 
++	int ux, uy;
++	struct wlr_scene_tree *px_tree = scene_node_px(node, &ux, &uy);
++	if (px_tree != NULL) {
++		/* below a pixel tree: the point in units, through the output's pixels
++		 * where the output has the tree's scale */
++		int ax, ay;
++		wlr_scene_node_coords(&px_tree->node, &ax, &ay);
++		double k = (double)px_tree->px_den / (120.0 * px_tree->px_n);
++		rx = (at_data->lx - ax) * k - ux;
++		ry = (at_data->ly - ay) * k - uy;
++
++		struct wlr_scene *scene = scene_node_get_root(node);
++		struct wlr_scene_output *scene_output;
++		wl_list_for_each(scene_output, &scene->outputs, link) {
++			struct wlr_box output_box = { .x = scene_output->x, .y = scene_output->y };
++			wlr_output_effective_resolution(scene_output->output,
++				&output_box.width, &output_box.height);
++			float scale = scene_output->output->scale;
++			if (!wlr_box_contains_point(&output_box, at_data->lx, at_data->ly) ||
++					!px_scale_matches(px_tree, scale)) {
++				continue;
++			}
++			rx = ((at_data->lx - output_box.x) * scale -
++				round((ax - output_box.x) * scale)) / px_tree->px_n - ux;
++			ry = ((at_data->ly - output_box.y) * scale -
++				round((ay - output_box.y) * scale)) / px_tree->px_n - uy;
++			break;
++		}
++	}
++
+ 	if (node->type == WLR_SCENE_NODE_BUFFER) {
+ 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+ 
+@@ -1202,6 +1483,84 @@ struct render_list_entry {
+ 	int x, y;
+ };
+ 
++/* Glassine: what to draw of a buffer: src in buffer pixels, dst in output pixels */
++struct px_piece {
++	struct wlr_fbox src;
++	struct wlr_box dst;
++};
++
++static bool px_piece_clip(struct px_piece *piece, const struct wlr_box *clip) {
++	struct wlr_box c;
++	if (!wlr_box_intersection(&c, &piece->dst, clip)) {
++		return false;
++	}
++	double kx = piece->src.width / piece->dst.width;
++	double ky = piece->src.height / piece->dst.height;
++	piece->src.x += (c.x - piece->dst.x) * kx;
++	piece->src.y += (c.y - piece->dst.y) * ky;
++	piece->src.width = c.width * kx;
++	piece->src.height = c.height * ky;
++	piece->dst = c;
++	return true;
++}
++
++static bool px_whole(double v) {
++	return fabs(v - round(v)) < 1e-6;
++}
++
++/* The pieces (at most 4) that show src in dst, both before any transform. When
++ * the source is within one pixel of dst in both directions nothing is scaled
++ * (*exact): the pixels both have are drawn one to one from the top left, a
++ * source that is a pixel larger loses its last row or column, and one that is a
++ * pixel smaller has its last row or column drawn twice to fill dst. clip: an
++ * output box that cuts every piece. */
++static int px_pieces(const struct wlr_fbox *src, const struct wlr_box *dst,
++		const struct wlr_box *clip, struct px_piece *pieces, bool *exact) {
++	int n = 0;
++	int sw = (int)round(src->width), sh = (int)round(src->height);
++	*exact = px_whole(src->x) && px_whole(src->y) && px_whole(src->width) &&
++		px_whole(src->height) && abs(sw - dst->width) <= 1 && abs(sh - dst->height) <= 1 &&
++		sw > 0 && sh > 0 && dst->width > 0 && dst->height > 0;
++	if (!*exact) {
++		pieces[n++] = (struct px_piece){ .src = *src, .dst = *dst };
++	} else {
++		int w = sw < dst->width ? sw : dst->width;
++		int h = sh < dst->height ? sh : dst->height;
++		pieces[n++] = (struct px_piece){
++			.src = { .x = src->x, .y = src->y, .width = w, .height = h },
++			.dst = { .x = dst->x, .y = dst->y, .width = w, .height = h },
++		};
++		if (dst->width > w) {
++			pieces[n++] = (struct px_piece){
++				.src = { .x = src->x + w - 1, .y = src->y, .width = 1, .height = h },
++				.dst = { .x = dst->x + w, .y = dst->y, .width = 1, .height = h },
++			};
++		}
++		if (dst->height > h) {
++			pieces[n++] = (struct px_piece){
++				.src = { .x = src->x, .y = src->y + h - 1, .width = w, .height = 1 },
++				.dst = { .x = dst->x, .y = dst->y + h, .width = w, .height = 1 },
++			};
++		}
++		if (dst->width > w && dst->height > h) {
++			pieces[n++] = (struct px_piece){
++				.src = { .x = src->x + w - 1, .y = src->y + h - 1, .width = 1, .height = 1 },
++				.dst = { .x = dst->x + w, .y = dst->y + h, .width = 1, .height = 1 },
++			};
++		}
++	}
++	if (clip != NULL) {
++		int kept = 0;
++		for (int i = 0; i < n; i++) {
++			if (px_piece_clip(&pieces[i], clip)) {
++				pieces[kept++] = pieces[i];
++			}
++		}
++		n = kept;
++	}
++	return n;
++}
++
+ static void scene_entry_render(struct render_list_entry *entry, const struct render_data *data) {
+ 	struct wlr_scene_node *node = entry->node;
+ 
+@@ -1223,8 +1582,29 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
+ 		.x = x,
+ 		.y = y,
+ 	};
+-	scene_node_get_size(node, &dst_box.width, &dst_box.height);
+-	scale_box(&dst_box, data->scale);
++	struct wlr_box px_clip = {0};
++	int ux, uy;
++	struct wlr_scene_tree *px_tree = scene_node_px(node, &ux, &uy);
++	if (px_tree != NULL) {
++		/* below a pixel tree: the node's own box in output pixels */
++		int ax, ay;
++		wlr_scene_node_coords(&px_tree->node, &ax, &ay);
++		struct wlr_box units = { .x = ux, .y = uy };
++		scene_node_get_raw_size(node, &units.width, &units.height);
++		if (px_dev_box(px_tree, ax, ay, &units, data->logical.x, data->logical.y,
++				data->scale, &dst_box) && px_tree->px_clip_width > 0) {
++			px_clip = (struct wlr_box){
++				.x = (int)round((ax - data->logical.x) * data->scale),
++				.y = (int)round((ay - data->logical.y) * data->scale),
++				.width = px_tree->px_clip_width,
++				.height = px_tree->px_clip_height,
++			};
++		}
++	} else {
++		scene_node_get_size(node, &dst_box.width, &dst_box.height);
++		scale_box(&dst_box, data->scale);
++	}
++	struct wlr_box dst_dev = dst_box;
+ 
+ 	pixman_region32_t opaque;
+ 	pixman_region32_init(&opaque);
+@@ -1267,18 +1647,38 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
+ 			wlr_output_transform_invert(scene_buffer->transform);
+ 		transform = wlr_output_transform_compose(transform, data->transform);
+ 
+-		wlr_render_pass_add_texture(data->render_pass, &(struct wlr_render_texture_options) {
+-			.texture = texture,
+-			.src_box = scene_buffer->src_box,
+-			.dst_box = dst_box,
+-			.transform = transform,
+-			.clip = &render_region,
+-			.alpha = &scene_buffer->opacity,
+-			.filter_mode = scene_buffer->filter_mode,
+-			.blend_mode = !data->output->scene->calculate_visibility ||
+-					pixman_region32_not_empty(&opaque) ?
+-				WLR_RENDER_BLEND_MODE_PREMULTIPLIED : WLR_RENDER_BLEND_MODE_NONE,
+-		});
++		/* Glassine: at a fractional scale, and below a pixel tree, a buffer within
++		 * one pixel of its box is drawn pixel for pixel (px_pieces) */
++		struct px_piece pieces[4] = {{ .src = scene_buffer->src_box, .dst = dst_box }};
++		int n_pieces = 1;
++		bool exact = false;
++		if (scene_buffer->transform == WL_OUTPUT_TRANSFORM_NORMAL &&
++				(px_tree != NULL || floor(data->scale) != data->scale)) {
++			struct wlr_fbox src = scene_buffer->src_box;
++			if (wlr_fbox_empty(&src)) {
++				src = (struct wlr_fbox){ .width = texture->width, .height = texture->height };
++			}
++			n_pieces = px_pieces(&src, &dst_dev, wlr_box_empty(&px_clip) ? NULL : &px_clip,
++				pieces, &exact);
++			for (int i = 0; i < n_pieces; i++) {
++				transform_output_box(&pieces[i].dst, data);
++			}
++		}
++
++		for (int i = 0; i < n_pieces; i++) {
++			wlr_render_pass_add_texture(data->render_pass, &(struct wlr_render_texture_options) {
++				.texture = texture,
++				.src_box = pieces[i].src,
++				.dst_box = pieces[i].dst,
++				.transform = transform,
++				.clip = &render_region,
++				.alpha = &scene_buffer->opacity,
++				.filter_mode = exact ? WLR_SCALE_FILTER_NEAREST : scene_buffer->filter_mode,
++				.blend_mode = !data->output->scene->calculate_visibility ||
++						pixman_region32_not_empty(&opaque) ?
++					WLR_RENDER_BLEND_MODE_PREMULTIPLIED : WLR_RENDER_BLEND_MODE_NONE,
++			});
++		}
+ 
+ 		struct wlr_scene_output_sample_event sample_event = {
+ 			.output = data->output,
+@@ -1642,6 +2042,11 @@ static bool scene_entry_try_direct_scanout(struct render_list_entry *entry,
+ 		return false;
+ 	}
+ 
++	int ux, uy;
++	if (scene_node_px(node, &ux, &uy) != NULL) {
++		return false;
++	}
++
+ 	int default_width = buffer->buffer->width;
+ 	int default_height = buffer->buffer->height;
+ 	wlr_output_transform_coords(buffer->transform, &default_width, &default_height);
+@@ -2068,6 +2473,10 @@ static void scene_output_for_each_scene_buffer(const struct wlr_box *output_box,
+ 	ly += node->y;
+ 
+ 	if (node->type == WLR_SCENE_NODE_BUFFER) {
++		int ux, uy;
++		if (scene_node_px(node, &ux, &uy) != NULL) {
++			wlr_scene_node_coords(node, &lx, &ly);
++		}
+ 		struct wlr_box node_box = { .x = lx, .y = ly };
+ 		scene_node_get_size(node, &node_box.width, &node_box.height);
+ 
+diff --git a/types/wlr_fractional_scale_v1.c b/types/wlr_fractional_scale_v1.c
+index 6079746..e3345f2 100644
+--- a/types/wlr_fractional_scale_v1.c
++++ b/types/wlr_fractional_scale_v1.c
+@@ -1,4 +1,5 @@
+ #include <assert.h>
++#include <math.h>
+ #include <stdlib.h>
+ #include <wlr/types/wlr_compositor.h>
+ #include <wlr/types/wlr_fractional_scale_v1.h>
+@@ -99,6 +100,24 @@ void wlr_fractional_scale_v1_notify_scale(struct wlr_surface *surface, double sc
+ 	wp_fractional_scale_v1_send_preferred_scale(info->resource, double_to_v120(scale));
+ }
+ 
++bool wlr_fractional_scale_v1_surface_has_object(struct wlr_surface *surface) {
++	struct wlr_addon *addon = wlr_addon_find(&surface->addons,
++		NULL, &fractional_scale_addon_impl);
++	if (addon == NULL) {
++		return false;
++	}
++	struct wlr_fractional_scale_v1 *info = wl_container_of(addon, info, addon);
++	return info->resource != NULL;
++}
++
++int32_t wlr_fractional_scale_v1_whole_scale(struct wlr_surface *surface, double scale) {
++	if (wlr_fractional_scale_v1_surface_has_object(surface)) {
++		return ceil(scale);
++	}
++	int32_t n = floor(scale + 0.5);
++	return n < 1 ? 1 : n;
++}
++
+ static void handle_get_fractional_scale(struct wl_client *client,
+ 		struct wl_resource *mgr_resource, uint32_t id,
+ 		struct wl_resource *surface_resource) {

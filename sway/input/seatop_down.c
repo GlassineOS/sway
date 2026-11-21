@@ -15,6 +15,9 @@ struct seatop_touch_point_event {
 	struct wl_list link;
 };
 
+// Glassine: a pixel view's surface coordinates are units, not layout px
+#include "../glassine-view-px.h"
+
 struct seatop_down_event {
 	struct sway_container *con;
 	struct sway_seat *seat;
@@ -43,8 +46,9 @@ static void handle_touch_motion(struct sway_seat *seat,
 
 	double moved_x = lx - point_event->ref_lx;
 	double moved_y = ly - point_event->ref_ly;
-	double sx = point_event->ref_con_lx + moved_x;
-	double sy = point_event->ref_con_ly + moved_y;
+	double units = glassine_px_surface_units(e->surface);
+	double sx = point_event->ref_con_lx + moved_x * units;
+	double sy = point_event->ref_con_ly + moved_y * units;
 
 	wlr_seat_touch_notify_motion(seat->wlr_seat, event->time_msec,
 		event->touch_id, sx, sy);
@@ -159,8 +163,9 @@ static void handle_pointer_motion(struct sway_seat *seat, uint32_t time_msec) {
 	if (seat_is_input_allowed(seat, e->surface)) {
 		double moved_x = seat->cursor->cursor->x - e->ref_lx;
 		double moved_y = seat->cursor->cursor->y - e->ref_ly;
-		double sx = e->ref_con_lx + moved_x;
-		double sy = e->ref_con_ly + moved_y;
+		double units = glassine_px_surface_units(e->surface);
+		double sx = e->ref_con_lx + moved_x * units;
+		double sy = e->ref_con_ly + moved_y * units;
 		wlr_seat_pointer_notify_motion(seat->wlr_seat, time_msec, sx, sy);
 	}
 }
@@ -180,8 +185,9 @@ static void handle_tablet_tool_motion(struct sway_seat *seat,
 	if (seat_is_input_allowed(seat, e->surface)) {
 		double moved_x = seat->cursor->cursor->x - e->ref_lx;
 		double moved_y = seat->cursor->cursor->y - e->ref_ly;
-		double sx = e->ref_con_lx + moved_x;
-		double sy = e->ref_con_ly + moved_y;
+		double units = glassine_px_surface_units(e->surface);
+		double sx = e->ref_con_lx + moved_x * units;
+		double sy = e->ref_con_ly + moved_y * units;
 		wlr_tablet_v2_tablet_tool_notify_motion(tool->tablet_v2_tool, sx, sy);
 	}
 }

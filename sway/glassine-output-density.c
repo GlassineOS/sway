@@ -27,6 +27,19 @@ void glassine_od_key(const char *make, const char *model, const char *serial, co
 	else snprintf(buf, len, "%s %s %s", part(make), part(model), part(serial));
 }
 
+bool glassine_od_size_plausible(int width_px, int height_px, int width_mm, int height_mm)
+{
+	static const int ratio[][2] = { { 16, 9 }, { 16, 10 }, { 160, 90 }, { 160, 100 } };
+	if (width_px <= 0 || height_px <= 0 || width_mm <= 0 || height_mm <= 0) return false;
+	double dw = (double)width_px / width_mm, dh = (double)height_px / height_mm;
+	if (dw < 1 || dw > 100 || dh < 1 || dh > 100) return false;
+	for (size_t i = 0; i < sizeof ratio / sizeof ratio[0]; i++) {
+		if ((width_mm == ratio[i][0] && height_mm == ratio[i][1]) ||
+		    (width_mm == ratio[i][1] && height_mm == ratio[i][0])) return false;
+	}
+	return true;
+}
+
 /* "DENSITY" with a dot, digits only: its value, else -1 */
 static double number(const char *s, size_t n)
 {

@@ -1,6 +1,8 @@
+#include <math.h>
 #include <assert.h>
 #include <stdlib.h>
 #include "log.h"
+#include "../glassine-view-px.h"
 #include "sway/input/seat.h"
 #include "sway/scene_descriptor.h"
 #include "sway/tree/root.h"
@@ -159,6 +161,7 @@ static void constrain_popup(struct sway_input_popup *popup) {
 
 	struct wlr_box geo = {0};
 	struct wlr_output *output;
+	double units = 1;
 
 	if (popup->desc.view) {
 		struct sway_view *view = popup->desc.view;
@@ -169,6 +172,14 @@ static void constrain_popup(struct sway_input_popup *popup) {
 		parent.width = view->geometry.width;
 		parent.height = view->geometry.height;
 		geo = view->geometry;
+		// Glassine: a pixel view's geometry is in its units; in layout px here
+		units = glassine_px_units(view);
+		if (units != 1) {
+			geo.x = (int)floor(geo.x / units);
+			geo.y = (int)floor(geo.y / units);
+			geo.width = parent.width = (int)ceil(view->geometry.width / units);
+			geo.height = parent.height = (int)ceil(view->geometry.height / units);
+		}
 	} else {
 		output = popup->fixed_output;
 	}
@@ -181,6 +192,15 @@ static void constrain_popup(struct sway_input_popup *popup) {
 	struct wlr_box cursor_area;
 	if (cursor_rect) {
 		cursor_area = text_input->input->current.cursor_rectangle;
+		if (units != 1) {
+			// Glassine: so is its text field's cursor
+			int x2 = (int)ceil((cursor_area.x + cursor_area.width) / units);
+			int y2 = (int)ceil((cursor_area.y + cursor_area.height) / units);
+			cursor_area.x = (int)floor(cursor_area.x / units);
+			cursor_area.y = (int)floor(cursor_area.y / units);
+			cursor_area.width = x2 - cursor_area.x;
+			cursor_area.height = y2 - cursor_area.y;
+		}
 	} else {
 		// Glassine: no cursor rectangle (Chromium sends none): where the
 		// field is, is unknown. The popup lies over the top of the window
