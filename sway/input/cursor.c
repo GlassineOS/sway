@@ -29,6 +29,7 @@
 #include "sway/tree/container.h"
 #include "sway/tree/root.h"
 #include "sway/tree/view.h"
+#include "../glassine-view-px.h"
 #include "sway/tree/workspace.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "sway/desktop/transaction.h"
@@ -1514,8 +1515,10 @@ static void check_constraint_region(struct sway_cursor *cursor) {
 
 		struct sway_container *con = view->container;
 
-		double sx = cursor->cursor->x - con->pending.content_x + view->geometry.x;
-		double sy = cursor->cursor->y - con->pending.content_y + view->geometry.y;
+		// Glassine: a pixel view's surface coordinates are units
+		double units = glassine_px_units(view);
+		double sx = (cursor->cursor->x - con->pending.content_x) * units + view->geometry.x;
+		double sy = (cursor->cursor->y - con->pending.content_y) * units + view->geometry.y;
 
 		if (!pixman_region32_contains_point(region,
 				floor(sx), floor(sy), NULL)) {
@@ -1526,8 +1529,8 @@ static void check_constraint_region(struct sway_cursor *cursor) {
 				double sy = (boxes[0].y1 + boxes[0].y2) / 2.;
 
 				wlr_cursor_warp_closest(cursor->cursor, NULL,
-					sx + con->pending.content_x - view->geometry.x,
-					sy + con->pending.content_y - view->geometry.y);
+					(sx - view->geometry.x) / units + con->pending.content_x,
+					(sy - view->geometry.y) / units + con->pending.content_y);
 
 				cursor_rebase(cursor);
 			}
@@ -1979,8 +1982,10 @@ static void warp_to_constraint_cursor_hint(struct sway_cursor *cursor) {
 
 		struct sway_container *con = view->container;
 
-		double lx = sx + con->pending.content_x - view->geometry.x;
-		double ly = sy + con->pending.content_y - view->geometry.y;
+		// Glassine: a pixel view's surface coordinates are units
+		double units = glassine_px_units(view);
+		double lx = (sx - view->geometry.x) / units + con->pending.content_x;
+		double ly = (sy - view->geometry.y) / units + con->pending.content_y;
 
 		wlr_cursor_warp(cursor->cursor, NULL, lx, ly);
 

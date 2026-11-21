@@ -14,6 +14,7 @@
 #include "sway/tree/container.h"
 #include "sway/tree/node.h"
 #include "sway/tree/view.h"
+#include "../glassine-view-px.h"
 #include "sway/tree/workspace.h"
 #include "list.h"
 #include "log.h"
@@ -790,7 +791,10 @@ static bool should_configure(struct sway_node *node,
 #endif
 	if (cstate->content_width == istate->content_width &&
 			cstate->content_height == istate->content_height) {
-		return false;
+		// Glassine: a pixel view's size in units can change with its place
+		return glassine_px_needs_configure(node->sway_container->view,
+			istate->content_x, istate->content_y,
+			istate->content_width, istate->content_height);
 	}
 	return true;
 }
@@ -805,6 +809,12 @@ static void transaction_commit(struct sway_transaction *transaction) {
 		struct sway_node *node = instruction->node;
 		bool hidden = node_is_view(node) && !node->destroying &&
 			!view_is_visible(node->sway_container->view);
+		if (node_is_view(node) && !node->destroying &&
+				instruction->container_state.workspace) {
+			// Glassine: the view's path for the output it is on now
+			glassine_px_update(node->sway_container->view,
+				instruction->container_state.workspace->output);
+		}
 		if (should_configure(node, instruction)) {
 			instruction->serial = view_configure(node->sway_container->view,
 					instruction->container_state.content_x,

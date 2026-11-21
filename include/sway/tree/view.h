@@ -90,6 +90,15 @@ struct sway_view {
 	// transaction state. Updated on every commit.
 	struct wlr_box geometry;
 
+	/* Glassine: a whole-scale-only client's view, pixel for pixel
+	 * (glassine-view-px.h). px_n 0: sway's own path. geometry, natural_* and the
+	 * client's size hints are in units then. */
+	int px_n;
+	float px_scale;
+	bool px_fractional; // the client made a fractional scale object
+	bool px_reconfigure; // the path changed since the last configure
+	int px_conf_width, px_conf_height; // the last configure's size, in units
+
 	struct wlr_ext_foreign_toplevel_handle_v1 *ext_foreign_toplevel;
 
 	struct wlr_foreign_toplevel_handle_v1 *foreign_toplevel;

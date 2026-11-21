@@ -71,8 +71,25 @@ empty regions costing the service nothing, a region that becomes private forgott
 nothing more, the region's ink (also a stroke written while the service was away, in writing
 order) handed to a restarted service, and a service without regions getting no region op.
 
-`output-density-test.sh` runs too (the host's C compiler): the output key and the person's
-density file (`sway/glassine-output-density.c`).
+`output-density-test.sh` runs too (the host's C compiler): the output key, the person's
+density file and which reported physical sizes count (`sway/glassine-output-density.c`).
+
+`ui-scale-test.sh [SWAY [BASE]]` runs too (Docker, as `ink-popup-test.sh`): fractional output
+scales. It runs this sway headless with an output of 1404x1872 at the scales 1.6, 1.8, 2.4,
+0.8 and 2 (and with the output elsewhere in the layout, turned by 90, 180 and 270 degrees,
+and at 2.6, where the nearest whole number is 3) and `ui-scale-client.c` as a whole-scale-only client and as a fractional one, whose
+buffers have a value of their own in every pixel, and compares screenshots (wlr-screencopy)
+with them byte for byte: the scale the client is told (the nearest whole number; the
+fractional scale), a tiled window's and a floating window's configure size and pixels, a
+fractional client's buffer that is a pixel larger or smaller than its box (cut, or its last
+row drawn twice, never scaled), a commit with a small damage box, a subsurface, an xdg
+popup, pointer positions in the client's own coordinates (also in a drag), a window of one
+size only, a window moved between two outputs of different scales, an output's scale changed
+under a window, and the reported physical size in `get_outputs`. BASE: a sway built from the
+tree before a change; the scale 2 cases then run on both, and what the client is told and
+three screenshots of the whole output must be the same. Not covered: touch and tablet
+positions (headless sway has neither), the GLES renderer (the test uses pixman). Logs go to
+`build-test/ui-scale/`.
 
 `shm-seal-test.sh` runs too (curl, patch and a C compiler): it builds wlroots' `util/shm.c`
 with our patches and checks that the pixman renderer's buffers take `F_SEAL_SHRINK`, as the
