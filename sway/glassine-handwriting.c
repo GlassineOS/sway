@@ -107,6 +107,7 @@ struct hw_region {
 	double strength;
 	int32_t layer;
 	uint32_t mode;
+	uint32_t display;               /* version 3: its words with ink shown as ink or set */
 	uint32_t next;                  /* the next live stroke number */
 	bool announced;                 /* the service knows it */
 	bool holds;                     /* it holds writing: the service may hear of it */
@@ -575,6 +576,8 @@ static void region_send_set(struct hw_region *r)
 	char u[64];
 	units(u, sizeof u);
 	json_object_object_add(m, "units", json_object_new_string(u));
+	if (r->display == GLASSINE_HANDWRITING_REGION_V1_DISPLAY_SET)
+		json_object_object_add(m, "display", json_object_new_string("set"));
 	svc_send(m);
 	r->dirty = false;
 }
@@ -737,15 +740,26 @@ static void got_region_value(struct hw_region *r, json_object *m)
 			uint32_t start = json_object_object_get_ex(w, "start", &a) ? (uint32_t)json_object_get_int64(a) : 0;
 			uint32_t len = json_object_object_get_ex(w, "length", &a) ? (uint32_t)json_object_get_int64(a) : 0;
 			if ((size_t)start + len > tlen) continue;
-			if (json_object_object_get_ex(w, "path", &a)) {
+			/* a word with a path: set (no strokes), or an ink word shown set (display set,
+			 * version 3; an older client gets it as its ink) */
+			json_object *path = NULL;
+			bool ink = json_object_object_get_ex(w, "strokes", &a);
+			bool has_path = json_object_object_get_ex(w, "path", &path);
+			bool shown = ink && has_path && wl_resource_get_version(r->res) >= 3;
+			/* a path that doesn't parse: a set word is dropped, a shown one comes as its ink */
+			if (has_path && (!ink || shown) && send_shape(r, path)) {
 				int32_t box[4] = { 0 };
 				if (json_object_object_get_ex(w, "box", &b) && json_object_is_type(b, json_type_array) &&
 				    json_object_array_length(b) == 4)
 					for (int j = 0; j < 4; j++) box[j] = fx(json_object_array_get_idx(b, j));
-				if (!send_shape(r, a)) continue;
-				glassine_handwriting_region_v1_send_set_word(r->res, serial, start, len, box[0], box[1],
-									     box[2] - box[0], box[3] - box[1]);
-			} else {
+				if (shown) {
+					send_strokes(r, w, "strokes", false);
+					glassine_handwriting_region_v1_send_word_shown_set(r->res, serial, start, len, box[0], box[1],
+											   box[2] - box[0], box[3] - box[1]);
+				} else
+					glassine_handwriting_region_v1_send_set_word(r->res, serial, start, len, box[0], box[1],
+										     box[2] - box[0], box[3] - box[1]);
+			} else if (ink || !has_path) {
 				send_strokes(r, w, "strokes", false);
 				int32_t dx = json_object_object_get_ex(w, "dx", &a) ? fx(a) : 0;
 				int32_t dy = json_object_object_get_ex(w, "dy", &a) ? fx(a) : 0;
@@ -1282,6 +1296,17 @@ static void r_set_mode(struct wl_client *c, struct wl_resource *res, uint32_t mo
 	region_set_mode(region_from(res), mode);
 }
 
+/* version 3: the words with ink shown as ink or set in the person's font; a choice for the
+ * service (region_set), nothing changes here */
+static void r_set_display(struct wl_client *c, struct wl_resource *res, uint32_t display)
+{
+	struct hw_region *r = region_from(res);
+	display = display == GLASSINE_HANDWRITING_REGION_V1_DISPLAY_SET ? display : GLASSINE_HANDWRITING_REGION_V1_DISPLAY_INK;
+	if (display == r->display) return;
+	r->display = display;
+	region_changed(r, true);
+}
+
 static void r_add_data(struct wl_client *c, struct wl_resource *res, uint32_t kind, struct wl_array *a)
 {
 	struct hw_region *r = region_from(res);
@@ -1414,6 +1439,7 @@ static const struct glassine_handwriting_region_v1_interface region_impl = {
 	.set_neaten = r_set_neaten,
 	.set_layer = r_set_layer,
 	.set_mode = r_set_mode,
+	.set_display = r_set_display,
 	.add_data = r_add_data,
 	.edit = r_edit,
 	.report = r_report,
@@ -1541,7 +1567,7 @@ void glassine_hw_init(struct wl_display *display, const struct glassine_hw_hooks
 	wl_list_init(&H.managers);
 	wl_array_init(&H.pts);
 	H.cmd = service ? strdup(service) : NULL;
-	wl_global_create(display, &glassine_handwriting_manager_v1_interface, 2, NULL, mgr_bind);
+	wl_global_create(display, &glassine_handwriting_manager_v1_interface, 3, NULL, mgr_bind);
 	svc_start();
 }
 

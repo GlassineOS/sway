@@ -141,7 +141,7 @@ def main():
 
     print("writing regions: capabilities")
     c = w.client()
-    check("a version 2 manager gets the regions bit (caps 23)", c.wait(lambda l: l == "caps 23", 10) is not None)
+    check("a version 3 manager gets the regions bit (caps 23)", c.wait(lambda l: l == "caps 23", 10) is not None)
     v1 = w.client("-1")
     check("a version 1 manager gets no regions bit (caps 7)", v1.wait(lambda l: l.startswith("caps")) == "caps 7")
     v1.stop()
@@ -285,6 +285,27 @@ def main():
     check("the report reaches the service with its serial and action",
           rep and '"serial":%d' % serial in rep[-1] and '"action":"accepted"' in rep[-1])
 
+    print("writing regions: the display (version 3)")
+    c.drain(0.3)
+    c.send("display a 1")
+    v = c.wait(lambda l: l.startswith("value a"))
+    settle(w.log)
+    check("the display reaches the service with the region's choices",
+          any('"op":"region_set"' in l and '"display":"set"' in l for l in service_log(w.log)))
+    lay = c.lines[-8:]
+    sw = [l for l in lay if l.startswith("shownword a")]
+    check("an ink word comes shown set: its strokes and its shape",
+          sw and sw[0].endswith("strokes=0") and " shape=" in sw[0] and " op0=0" in sw[0])
+    check("a word without ink stays a set word", any(l.startswith("setword a") for l in lay))
+    check("and no stroke leaves for it", not any(l.startswith("gone a") for l in lay))
+    check("the value stays the same", v and v.endswith("text=w0 hello"))
+    c.send("display a 0")
+    v = c.wait(lambda l: l.startswith("value a"))
+    lay = c.lines[-8:]
+    check("display ink shows its strokes again",
+          any(l.startswith("word a") and l.endswith("strokes=0") for l in lay) and
+          not any(l.startswith("shownword a") for l in lay))
+
     c.send("long a 5000")
     v = c.wait(lambda l: l.startswith("value a"))
     check("a value of 5000 bytes arrives whole, in parts", v and " len=5000 " in v)
@@ -354,6 +375,21 @@ def main():
     log = service_log(w.log)
     check("the surface's end when the app goes", '"op":"destroy","s":1' in "".join(log[-3:]) or
           any('"op":"destroy","s":1' in l for l in log))
+    w.stop()
+
+    print("writing regions: a version 2 client")
+    w = World("v2")
+    c = w.client("-2")
+    c.wait(lambda l: l == "ready", 10)
+    for cmd in ["surface", "region shown 0 0 100 100", "sync"]:
+        c.send(cmd)
+    c.wait(lambda l: l == "synced")
+    w.pen(10, 10)
+    c.wait(lambda l: l.startswith("value shown"))
+    check("an ink word with a shape comes as its ink to a version 2 client",
+          any(l.startswith("word shown") and l.endswith("strokes=0") for l in c.lines) and
+          not any(l.startswith("shownword") for l in c.lines))
+    c.stop()
     w.stop()
 
     print("writing regions: a service without regions")
