@@ -4,12 +4,17 @@
  * handwriting object and ends where it lifts, also when sway sends the app emulated pointer
  * events instead of tablet ones. The eraser end writes nothing here.
  *
+ * The ink's units: the logical px per mm of the output the pen writes on, from its physical
+ * size, else from the person's density for that output (glassine-output-density.h, kept by
+ * Settings), else none: the units stay the pen's own (spec 004 FR-017).
+ *
  * GLASSINE_HANDWRITING_SERVICE names the service's program (default
  * glassine-handwriting-service on PATH); empty: no service, raw strokes only. */
 #include <math.h>
 #include <pixman.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_output.h>
@@ -23,6 +28,7 @@
 #include "sway/tree/root.h"
 #include "glassine-handwriting.h"
 #include "glassine-handwriting-sway.h"
+#include "glassine-output-density.h"
 
 static void identify(struct wl_client *client, char *buf, size_t size)
 {
@@ -71,12 +77,41 @@ void glassine_hw_sway_init(struct wl_display *display)
 	glassine_hw_init(display, &hooks, cmd ? cmd : "glassine-handwriting-service");
 }
 
+/* the person's density for an output of unknown size: the file read again when it changed */
+static double setting(struct wlr_output *o)
+{
+	static char path[4096], key[512];
+	static struct timespec mtime;
+	static off_t size = -1;
+	static double density;
+	char p[4096], k[512];
+	glassine_od_file(p, sizeof p);
+	glassine_od_key(o->make, o->model, o->serial, o->name, k, sizeof k);
+	struct stat st;
+	if (stat(p, &st)) return 0;
+	if (strcmp(p, path) || strcmp(k, key) || st.st_size != size || st.st_mtim.tv_sec != mtime.tv_sec ||
+	    st.st_mtim.tv_nsec != mtime.tv_nsec) {
+		snprintf(path, sizeof path, "%s", p);
+		snprintf(key, sizeof key, "%s", k);
+		mtime = st.st_mtim;
+		size = st.st_size;
+		density = glassine_od_lookup(p, k);
+	}
+	return density;
+}
+
 static void per_mm(struct sway_cursor *cursor)
 {
 	/* the mode's px over the panel's mm, both as the mode is (unturned), in logical px */
 	struct wlr_output *o = wlr_output_layout_output_at(root->output_layout, cursor->cursor->x, cursor->cursor->y);
-	if (!o || o->phys_width <= 0 || o->width <= 0) return;
-	glassine_hw_set_per_mm(o->width / (o->scale > 0 ? o->scale : 1) / o->phys_width);
+	if (!o || o->width <= 0) return;
+	double scale = o->scale > 0 ? o->scale : 1;
+	if (o->phys_width > 0) {
+		glassine_hw_set_per_mm(o->width / scale / o->phys_width);
+		return;
+	}
+	double d = setting(o);
+	glassine_hw_set_per_mm(d > 0 ? d / scale : 0);
 }
 
 void glassine_hw_sway_tip(struct sway_cursor *cursor, struct sway_tablet_tool *tool, struct wlr_surface *surface,

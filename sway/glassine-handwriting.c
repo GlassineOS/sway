@@ -16,6 +16,14 @@
  * GlassineOS/handwriting); writes never block (queued, sent when the socket is writable).
  * Without the service, raw strokes still flow and the capabilities say so.
  *
+ * Version 2 adds writing regions (GlassineOS/handwriting spec 005): an object that made
+ * one is in region mode, and each stroke goes to the topmost region it starts in, in the
+ * region's coordinates, or nowhere. A region reaches the service only once it holds
+ * writing (its first stroke, edit or restore) and wants it (reading or neatening on, not
+ * private), and only when the service's hello says it reads regions; a move sends nothing.
+ * The raw strokes a region sent, its last value and saved state are kept here, so that a
+ * restarted service gets them back (region_restore) without the app.
+ *
  * This file uses libwayland-server, json-c and libc only (no wlroots types): sway's glue
  * (cursor.c, server.c) feeds it the pen's tool events and regions through hooks, and the
  * host test's stand-in compositor (test/handwriting-standin.c) does the same. */
@@ -43,6 +51,13 @@
 #define PART 128                /* points per points event (the wire takes 4096 bytes a message) */
 #define MAX_EVENT_STR 1024      /* bytes of a string in an event */
 #define MAX_READING 512         /* stroke numbers in a reading */
+#define DATA_PART 2048          /* bytes of a data part (regions) */
+#define MAX_DATA_TEXT 65536     /* bytes of text gathered from add_data */
+#define MAX_DATA_STATE (1 << 20)        /* bytes of saved state gathered from add_data */
+#define MAX_NAME 256
+
+struct held { uint32_t k; struct wl_array pts; };
+struct hw_region;
 
 struct hw_obj {
 	struct wl_list link;
@@ -60,8 +75,43 @@ struct hw_obj {
 	bool announced;                 /* the service knows it (surface + set sent) */
 	struct wl_event_source *idle;   /* the choices go to the service once a client's batch is in */
 	/* the strokes held (for neat_stroke: the raw points with x, y replaced), by number */
-	struct held { uint32_t k; struct wl_array pts; } *held;
+	struct held *held;
 	size_t nheld;
+	/* version 2: writing regions */
+	bool region_mode;               /* made a region once: strokes go to regions only */
+	uint32_t mode_all;              /* the mode new regions start in (set_mode) */
+	uint32_t region_seq;            /* creation order, for equal layers */
+	struct wl_list regions;         /* hw_region.link */
+};
+
+struct hw_region {
+	struct wl_list link;            /* hw_obj.regions */
+	struct wl_resource *res;
+	struct hw_obj *obj;             /* NULL once the object is gone: the region is inert */
+	uint32_t rid;                   /* the service's name for it */
+	uint32_t seq;
+	char *name;
+	double x, y, w, h;              /* surface coordinates */
+	void *clip;                     /* region copy (hooks), NULL: the whole rectangle */
+	double spacing, first;          /* region coordinates */
+	uint32_t purpose, hints;
+	char *langs;
+	bool reading, neaten;
+	double strength;
+	int32_t layer;
+	uint32_t mode;
+	uint32_t next;                  /* the next live stroke number */
+	bool announced;                 /* the service knows it */
+	bool holds;                     /* it holds writing: the service may hear of it */
+	bool dirty;                     /* choices changed since the last region_set */
+	struct wl_event_source *idle;
+	struct held *held;              /* raw strokes the service has, for neat and a restart */
+	size_t nheld;
+	char *value, *state;            /* the last value's text, its saved state (base64) */
+	struct wl_array in_text, in_state;      /* add_data gathered */
+	struct wl_array rp;             /* restore_points gathered */
+	struct held *rs;                /* restore_stroke gathered */
+	size_t nrs;
 };
 
 static struct {
@@ -82,8 +132,12 @@ static struct {
 	uint32_t caps;
 	char **langs; size_t nlangs;
 	char *cmd;
+	bool regions;                   /* the service reads regions (hello) */
+	uint32_t next_rid;
 	/* the stroke being written */
 	struct hw_obj *cur;
+	struct hw_region *cur_r;        /* in region mode: its region */
+	double rx, ry;                  /* that region's corner on the surface at pen-down */
 	struct wl_array pts;
 	double ox, oy;                  /* the surface's origin in the caller's coordinates */
 	double pressure, tilt_x, tilt_y;
@@ -93,6 +147,8 @@ static struct {
 /* ---- the service's channel ---- */
 
 static void svc_close(void);
+struct hw_region;
+static void region_replay(struct hw_region *r);
 
 static void svc_flush(void)
 {
@@ -146,6 +202,12 @@ static bool wants_service(const struct hw_obj *o)
 	return (o->neaten || o->text) && !private;
 }
 
+static void units(char *u, size_t n)
+{
+	if (H.per_mm > 0) snprintf(u, n, "device:%.4g", H.per_mm);
+	else snprintf(u, n, "device");
+}
+
 static void send_set(struct hw_obj *o)
 {
 	json_object *m = msg("set", o->sid);
@@ -169,16 +231,30 @@ static void send_set(struct hw_obj *o)
 		json_object_object_add(m, "box", a);
 	}
 	char u[64];
-	if (H.per_mm > 0) snprintf(u, sizeof u, "device:%.4g", H.per_mm);
-	else snprintf(u, sizeof u, "device");
+	units(u, sizeof u);
 	json_object_object_add(m, "units", json_object_new_string(u));
 	svc_send(m);
+}
+
+/* the service learns whose the surface is */
+static void send_surface(struct hw_obj *o)
+{
+	json_object *m = msg("surface", o->sid);
+	struct wl_client *c = wl_resource_get_client(o->res);
+	char sandbox[256] = "";
+	if (H.hooks.identify) H.hooks.identify(c, sandbox, sizeof sandbox);
+	pid_t pid; uid_t uid; gid_t gid;
+	wl_client_get_credentials(c, &pid, &uid, &gid);
+	if (sandbox[0]) json_object_object_add(m, "sandbox", json_object_new_string(sandbox));
+	json_object_object_add(m, "pid", json_object_new_int64(pid));
+	svc_send(m);
+	o->announced = true;
 }
 
 /* the service learns of a surface once it is there and the surface wants it */
 static void announce(struct hw_obj *o)
 {
-	if (H.fd < 0 || !H.up) return;
+	if (H.fd < 0 || !H.up || o->region_mode) return;   /* regions announce the surface themselves */
 	if (o->announced && !wants_service(o)) {
 		/* now private or off: the service forgets the surface and all it held */
 		svc_send(msg("destroy", o->sid));
@@ -187,23 +263,16 @@ static void announce(struct hw_obj *o)
 	}
 	if (!o->announced) {
 		if (!wants_service(o)) return;
-		json_object *m = msg("surface", o->sid);
-		struct wl_client *c = wl_resource_get_client(o->res);
-		char sandbox[256] = "";
-		if (H.hooks.identify) H.hooks.identify(c, sandbox, sizeof sandbox);
-		pid_t pid; uid_t uid; gid_t gid;
-		wl_client_get_credentials(c, &pid, &uid, &gid);
-		if (sandbox[0]) json_object_object_add(m, "sandbox", json_object_new_string(sandbox));
-		json_object_object_add(m, "pid", json_object_new_int64(pid));
-		svc_send(m);
-		o->announced = true;
+		send_surface(o);
 	}
 	send_set(o);
 }
 
 static void send_caps(struct wl_resource *mgr)
 {
-	glassine_handwriting_manager_v1_send_capabilities(mgr, H.caps | GLASSINE_HANDWRITING_MANAGER_V1_CAPABILITY_STROKES);
+	uint32_t caps = H.caps | GLASSINE_HANDWRITING_MANAGER_V1_CAPABILITY_STROKES;
+	if (wl_resource_get_version(mgr) < 2) caps &= ~(uint32_t)GLASSINE_HANDWRITING_MANAGER_V1_CAPABILITY_REGIONS;
+	glassine_handwriting_manager_v1_send_capabilities(mgr, caps);
 	for (size_t i = 0; i < H.nlangs; i++) glassine_handwriting_manager_v1_send_language(mgr, H.langs[i]);
 	glassine_handwriting_manager_v1_send_done(mgr);
 }
@@ -269,6 +338,8 @@ static void got_hello(json_object *m)
 		H.caps |= GLASSINE_HANDWRITING_MANAGER_V1_CAPABILITY_TEXT;
 	if (json_object_object_get_ex(m, "letters", &v) && json_object_get_boolean(v))
 		H.caps |= GLASSINE_HANDWRITING_MANAGER_V1_CAPABILITY_LETTERS;
+	H.regions = json_object_object_get_ex(m, "regions", &v) && json_object_get_boolean(v);
+	if (H.regions) H.caps |= GLASSINE_HANDWRITING_MANAGER_V1_CAPABILITY_REGIONS;
 	for (size_t i = 0; i < H.nlangs; i++) free(H.langs[i]);
 	free(H.langs);
 	H.langs = NULL; H.nlangs = 0;
@@ -284,7 +355,11 @@ static void got_hello(json_object *m)
 	H.fails = 0;
 	caps_changed();
 	struct hw_obj *o;
-	wl_list_for_each(o, &H.objs, link) announce(o);
+	wl_list_for_each(o, &H.objs, link) {
+		announce(o);
+		struct hw_region *r;
+		wl_list_for_each(r, &o->regions, link) region_replay(r);
+	}
 }
 
 static void got_neat(struct hw_obj *o, json_object *m)
@@ -350,10 +425,383 @@ static uint32_t result_of(const char *s)
 	return GLASSINE_HANDWRITING_V1_RESULT_NOT_KEPT;
 }
 
+/* ---- writing regions: the channel ---- */
+
+static void held_free(struct held *h, size_t n)
+{
+	for (size_t i = 0; i < n; i++) wl_array_release(&h[i].pts);
+	free(h);
+}
+
+/* a raw stroke's points as the channel takes them: [x, y, t, pressure, tilt_x, tilt_y] */
+static json_object *points_json(const struct wl_array *pts)
+{
+	json_object *a = json_object_new_array();
+	const int32_t *p = pts->data;
+	size_t n = pts->size / (6 * sizeof *p);
+	for (size_t i = 0; i < n; i++, p += 6) {
+		json_object *q = json_object_new_array();
+		json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[0])));
+		json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[1])));
+		json_object_array_add(q, json_object_new_int64((uint32_t)p[2]));
+		json_object_array_add(q, json_object_new_double(p[3] / 65535.0));
+		json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[4])));
+		json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[5])));
+		json_object_array_add(a, q);
+	}
+	return a;
+}
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *b64_encode(const unsigned char *d, size_t n)
+{
+	char *o = malloc((n + 2) / 3 * 4 + 1), *q = o;
+	if (!o) return NULL;
+	for (size_t i = 0; i < n; i += 3) {
+		uint32_t v = (uint32_t)d[i] << 16 | (i + 1 < n ? (uint32_t)d[i + 1] << 8 : 0) | (i + 2 < n ? d[i + 2] : 0);
+		*q++ = B64[v >> 18 & 63];
+		*q++ = B64[v >> 12 & 63];
+		*q++ = i + 1 < n ? B64[v >> 6 & 63] : '=';
+		*q++ = i + 2 < n ? B64[v & 63] : '=';
+	}
+	*q = 0;
+	return o;
+}
+
+/* base64 into a (false: not base64) */
+static bool b64_decode(const char *s, struct wl_array *a)
+{
+	uint32_t v = 0;
+	int bits = 0;
+	for (; *s && *s != '='; s++) {
+		const char *c = strchr(B64, *s);
+		if (!c || !*s) return false;
+		v = v << 6 | (uint32_t)(c - B64);
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			unsigned char *b = wl_array_add(a, 1);
+			if (!b) return false;
+			*b = (unsigned char)(v >> bits);
+		}
+	}
+	return true;
+}
+
+static bool utf8_ok(const unsigned char *s, size_t n)
+{
+	for (size_t i = 0; i < n;) {
+		unsigned char c = s[i];
+		size_t k = c < 0x80 ? 0 : (c & 0xe0) == 0xc0 ? 1 : (c & 0xf0) == 0xe0 ? 2 : (c & 0xf8) == 0xf0 ? 3 : 9;
+		if (!c || k == 9 || (k == 1 && c < 0xc2) || i + k >= n + (k ? 0 : 1)) return false;
+		for (size_t j = 1; j <= k; j++) if ((s[i + j] & 0xc0) != 0x80) return false;
+		i += k + 1;
+	}
+	return true;
+}
+
+/* bytes as data_part events of kind, in parts of DATA_PART */
+static void send_data(struct hw_region *r, uint32_t kind, const void *d, size_t n)
+{
+	for (size_t i = 0; i < n; i += DATA_PART) {
+		struct wl_array a = { .size = n - i < DATA_PART ? n - i : DATA_PART, .alloc = 0, .data = (char *)d + i };
+		glassine_handwriting_region_v1_send_data_part(r->res, kind, &a);
+	}
+}
+
+static json_object *rmsg(const char *op, struct hw_region *r)
+{
+	json_object *m = msg(op, r->obj->sid);
+	json_object_object_add(m, "r", json_object_new_int64(r->rid));
+	return m;
+}
+
+static bool region_private(const struct hw_region *r)
+{
+	return r->purpose == GLASSINE_HANDWRITING_V1_PURPOSE_PASSWORD || r->purpose == GLASSINE_HANDWRITING_V1_PURPOSE_PIN ||
+	       (r->hints & (0x40 | 0x80));
+}
+
+/* the service may hear of the region: reading or neatening on, not private (FR-010) */
+static bool region_wants(const struct hw_region *r)
+{
+	return r->obj && (r->reading || r->neaten) && !region_private(r);
+}
+
+static bool region_up(void)
+{
+	return H.fd >= 0 && H.up && H.regions;
+}
+
+static void region_send_set(struct hw_region *r)
+{
+	json_object *m = rmsg("region_set", r);
+	json_object_object_add(m, "reading", json_object_new_boolean(r->reading));
+	json_object_object_add(m, "neaten", json_object_new_boolean(r->neaten));
+	json_object_object_add(m, "strength", json_object_new_double(r->strength));
+	json_object_object_add(m, "purpose", json_object_new_int64(r->purpose));
+	json_object_object_add(m, "hints", json_object_new_int64(r->hints));
+	json_object_object_add(m, "languages", json_object_new_string(r->langs ? r->langs : ""));
+	json_object *g = json_object_new_array();
+	json_object_array_add(g, json_object_new_double(r->spacing));
+	json_object_array_add(g, json_object_new_double(r->first));
+	json_object_object_add(m, "guides", g);
+	json_object *z = json_object_new_array();
+	json_object_array_add(z, json_object_new_double(r->w));
+	json_object_array_add(z, json_object_new_double(r->h));
+	json_object_object_add(m, "size", z);
+	char u[64];
+	units(u, sizeof u);
+	json_object_object_add(m, "units", json_object_new_string(u));
+	svc_send(m);
+	r->dirty = false;
+}
+
+static void region_forget(struct hw_region *r)
+{
+	held_free(r->held, r->nheld);
+	r->held = NULL;
+	r->nheld = 0;
+	free(r->value); free(r->state);
+	r->value = r->state = NULL;
+}
+
+/* the region's announcement and choices, as they now stand: the service hears of a region
+ * that holds writing and wants it, and forgets one that no longer wants it */
+static void region_sync(struct hw_region *r)
+{
+	if (r->announced && (!region_wants(r) || !region_up())) {
+		if (region_up() && r->obj) svc_send(rmsg("region_destroy", r));
+		r->announced = false;
+		region_forget(r);       /* never sent again: private or off from here */
+		return;
+	}
+	if (!r->announced) {
+		if (!r->holds || !region_wants(r) || !region_up()) return;
+		if (!r->obj->announced) send_surface(r->obj);
+		json_object *m = rmsg("region", r);
+		json_object_object_add(m, "name", json_object_new_string(r->name ? r->name : ""));
+		svc_send(m);
+		r->announced = true;
+		region_send_set(r);
+		if (r->mode != GLASSINE_HANDWRITING_V1_MODE_INK) {
+			json_object *q = rmsg("region_mode", r);
+			json_object_object_add(q, "mode", json_object_new_string("text"));
+			svc_send(q);
+		}
+		return;
+	}
+	if (r->dirty) region_send_set(r);
+}
+
+static json_object *restore_msg(struct hw_region *r, const struct held *h, size_t n, const char *value, const char *state)
+{
+	json_object *m = rmsg("region_restore", r), *a = json_object_new_array();
+	for (size_t i = 0; i < n; i++) {
+		json_object *e = json_object_new_object();
+		json_object_object_add(e, "k", json_object_new_int64(h[i].k));
+		json_object_object_add(e, "points", points_json(&h[i].pts));
+		json_object_array_add(a, e);
+	}
+	json_object_object_add(m, "strokes", a);
+	if (value) json_object_object_add(m, "value", json_object_new_string(value));
+	if (state) json_object_object_add(m, "state", json_object_new_string(state));
+	return m;
+}
+
+/* after a new hello: the region's writing back to the restarted service */
+static void region_replay(struct hw_region *r)
+{
+	if (r->announced || !(r->nheld || r->value || r->state)) return;
+	region_sync(r);
+	if (r->announced) svc_send(restore_msg(r, r->held, r->nheld, r->value, r->state));
+}
+
+static struct hw_region *region_of(json_object *m)
+{
+	json_object *v;
+	if (!json_object_object_get_ex(m, "r", &v)) return NULL;
+	uint32_t rid = (uint32_t)json_object_get_int64(v);
+	struct hw_obj *o;
+	struct hw_region *r;
+	wl_list_for_each(o, &H.objs, link) wl_list_for_each(r, &o->regions, link) if (r->rid == rid) return r->announced ? r : NULL;
+	return NULL;
+}
+
+static struct held *region_held(struct hw_region *r, uint32_t k)
+{
+	for (size_t i = 0; i < r->nheld; i++) if (r->held[i].k == k) return &r->held[i];
+	return NULL;
+}
+
+/* the stroke numbers of key in m as strokes data; also, with drop, out of what is held */
+static void send_strokes(struct hw_region *r, json_object *m, const char *key, bool drop)
+{
+	json_object *v;
+	struct wl_array a;
+	uint_array(json_object_object_get_ex(m, key, &v) ? v : NULL, &a);
+	send_data(r, GLASSINE_HANDWRITING_REGION_V1_DATA_KIND_STROKES, a.data, a.size);
+	if (drop) {
+		const uint32_t *k = a.data;
+		for (size_t i = 0; i < a.size / sizeof *k; i++) {
+			struct held *h = region_held(r, k[i]);
+			if (!h) continue;
+			wl_array_release(&h->pts);
+			*h = r->held[--r->nheld];
+		}
+	}
+	wl_array_release(&a);
+}
+
+static void send_text(struct hw_region *r, const char *t)
+{
+	send_data(r, GLASSINE_HANDWRITING_REGION_V1_DATA_KIND_TEXT, t, strlen(t));
+}
+
+static int32_t fx(json_object *v)
+{
+	return wl_fixed_from_double(json_object_get_double(v));
+}
+
+/* a set word's path ("M", x, y, "L", …) as shape data; false: not a path */
+static bool send_shape(struct hw_region *r, json_object *path)
+{
+	if (!path || !json_object_is_type(path, json_type_array)) return false;
+	struct wl_array a;
+	wl_array_init(&a);
+	size_t n = json_object_array_length(path);
+	for (size_t i = 0; i < n;) {
+		const char *op = json_object_get_string(json_object_array_get_idx(path, i++));
+		static const char ops[] = "MLQCZ";
+		static const int ncoord[] = { 2, 2, 4, 6, 0 };
+		const char *c = op && op[0] && !op[1] ? strchr(ops, op[0]) : NULL;
+		if (!c || i + (size_t)ncoord[c - ops] > n) { wl_array_release(&a); return false; }
+		int32_t *q = wl_array_add(&a, (size_t)(1 + ncoord[c - ops]) * sizeof *q);
+		if (!q) { wl_array_release(&a); return false; }
+		*q++ = (int32_t)(c - ops);
+		for (int j = 0; j < ncoord[c - ops]; j++) *q++ = fx(json_object_array_get_idx(path, i++));
+	}
+	send_data(r, GLASSINE_HANDWRITING_REGION_V1_DATA_KIND_SHAPE, a.data, a.size);
+	wl_array_release(&a);
+	return true;
+}
+
+static void got_region_value(struct hw_region *r, json_object *m)
+{
+	json_object *v, *words;
+	uint32_t serial = json_object_object_get_ex(m, "serial", &v) ? (uint32_t)json_object_get_int64(v) : 0;
+	const char *text = str_of(m, "text");
+	size_t tlen = strlen(text);
+	if (!utf8_ok((const unsigned char *)text, tlen)) return;
+	struct wl_array state;
+	wl_array_init(&state);
+	const char *st = json_object_object_get_ex(m, "state", &v) ? json_object_get_string(v) : NULL;
+	if (st && !b64_decode(st, &state)) { wl_array_release(&state); return; }
+	if (json_object_object_get_ex(m, "words", &words) && json_object_is_type(words, json_type_array)) {
+		for (size_t i = 0; i < json_object_array_length(words); i++) {
+			json_object *w = json_object_array_get_idx(words, i), *a, *b;
+			uint32_t start = json_object_object_get_ex(w, "start", &a) ? (uint32_t)json_object_get_int64(a) : 0;
+			uint32_t len = json_object_object_get_ex(w, "length", &a) ? (uint32_t)json_object_get_int64(a) : 0;
+			if ((size_t)start + len > tlen) continue;
+			if (json_object_object_get_ex(w, "path", &a)) {
+				int32_t box[4] = { 0 };
+				if (json_object_object_get_ex(w, "box", &b) && json_object_is_type(b, json_type_array) &&
+				    json_object_array_length(b) == 4)
+					for (int j = 0; j < 4; j++) box[j] = fx(json_object_array_get_idx(b, j));
+				if (!send_shape(r, a)) continue;
+				glassine_handwriting_region_v1_send_set_word(r->res, serial, start, len, box[0], box[1],
+									     box[2] - box[0], box[3] - box[1]);
+			} else {
+				send_strokes(r, w, "strokes", false);
+				int32_t dx = json_object_object_get_ex(w, "dx", &a) ? fx(a) : 0;
+				int32_t dy = json_object_object_get_ex(w, "dy", &a) ? fx(a) : 0;
+				glassine_handwriting_region_v1_send_word(r->res, serial, start, len, dx, dy);
+			}
+		}
+	}
+	if (json_object_object_get_ex(m, "gone", &v)) {
+		send_strokes(r, m, "gone", true);
+		glassine_handwriting_region_v1_send_gone(r->res, serial);
+	}
+	send_text(r, text);
+	send_data(r, GLASSINE_HANDWRITING_REGION_V1_DATA_KIND_STATE, state.data, state.size);
+	glassine_handwriting_region_v1_send_value(r->res, serial);
+	wl_array_release(&state);
+	free(r->value); free(r->state);
+	r->value = strdup(text);
+	r->state = st ? strdup(st) : NULL;
+}
+
+static void got_region(const char *op, json_object *m)
+{
+	struct hw_region *r = region_of(m);
+	if (!r || !r->obj) return;
+	json_object *v;
+	uint32_t serial = json_object_object_get_ex(m, "serial", &v) ? (uint32_t)json_object_get_int64(v) : 0;
+	if (!strcmp(op, "neat")) {
+		if (!r->neaten || !json_object_object_get_ex(m, "k", &v)) return;
+		struct held *h = region_held(r, (uint32_t)json_object_get_int64(v));
+		json_object *pts;
+		if (!h || !json_object_object_get_ex(m, "points", &pts) || !json_object_is_type(pts, json_type_array)) return;
+		size_t n = h->pts.size / (6 * sizeof(int32_t));
+		if (json_object_array_length(pts) != n) return;
+		struct wl_array a;
+		wl_array_init(&a);
+		int32_t *q = wl_array_add(&a, h->pts.size);
+		if (!q) { wl_array_release(&a); return; }
+		memcpy(q, h->pts.data, h->pts.size);
+		for (size_t i = 0; i < n; i++) {
+			json_object *p = json_object_array_get_idx(pts, i);
+			if (!json_object_is_type(p, json_type_array) || json_object_array_length(p) < 2) { wl_array_release(&a); return; }
+			q[6 * i] = fx(json_object_array_get_idx(p, 0));
+			q[6 * i + 1] = fx(json_object_array_get_idx(p, 1));
+		}
+		const char *how = str_of(m, "how");
+		const size_t point = 6 * sizeof(int32_t);
+		for (size_t i = 0; i < n; i += PART) {
+			struct wl_array part = { .size = (n - i < PART ? n - i : PART) * point, .alloc = 0,
+						 .data = (char *)a.data + i * point };
+			glassine_handwriting_region_v1_send_points(r->res, h->k, GLASSINE_HANDWRITING_V1_KIND_NEAT, &part);
+		}
+		glassine_handwriting_region_v1_send_neat_stroke(r->res, h->k,
+			!strcmp(how, "line") ? GLASSINE_HANDWRITING_V1_HOW_LINE :
+			!strcmp(how, "pulled") ? GLASSINE_HANDWRITING_V1_HOW_PULLED : GLASSINE_HANDWRITING_V1_HOW_KEPT);
+		wl_array_release(&a);
+	} else if (!strcmp(op, "value")) {
+		got_region_value(r, m);
+	} else if (!strcmp(op, "candidates")) {
+		json_object *items;
+		uint32_t n = 0;
+		if (json_object_object_get_ex(m, "items", &items) && json_object_is_type(items, json_type_array)) {
+			for (size_t i = 0; i < json_object_array_length(items); i++) {
+				json_object *c = json_object_array_get_idx(items, i), *fit;
+				const char *t = str_of(c, "text");
+				if (!utf8_ok((const unsigned char *)t, strlen(t))) continue;
+				bool ok = json_object_object_get_ex(c, "fit", &fit) && json_object_get_boolean(fit);
+				send_text(r, t);
+				glassine_handwriting_region_v1_send_candidate(r->res, serial, n++, origin_of(str_of(c, "from")), ok);
+			}
+		}
+		glassine_handwriting_region_v1_send_candidates_done(r->res, serial, n);
+	} else if (!strcmp(op, "gesture")) {
+		const char *k = str_of(m, "kind");
+		uint32_t kind = !strcmp(k, "strike") ? GLASSINE_HANDWRITING_REGION_V1_GESTURE_KIND_STRIKE :
+				!strcmp(k, "scratch") ? GLASSINE_HANDWRITING_REGION_V1_GESTURE_KIND_SCRATCH :
+				!strcmp(k, "caret") ? GLASSINE_HANDWRITING_REGION_V1_GESTURE_KIND_CARET : 99;
+		if (kind == 99) return;
+		send_strokes(r, m, "strokes", false);
+		glassine_handwriting_region_v1_send_gesture(r->res, serial, kind);
+	} else if (!strcmp(op, "report")) {
+		glassine_handwriting_region_v1_send_report_done(r->res, serial, result_of(str_of(m, "result")));
+	}
+}
+
 static void got(json_object *m)
 {
 	const char *op = str_of(m, "op");
 	if (!strcmp(op, "hello")) { got_hello(m); return; }
+	if (!strncmp(op, "region_", 7)) { got_region(op + 7, m); return; }
 	json_object *v;
 	struct hw_obj *o = json_object_object_get_ex(m, "s", &v) ? obj_of((uint32_t)json_object_get_int64(v)) : NULL;
 	if (!o) return;
@@ -448,8 +896,13 @@ static void svc_close(void)
 	bool was = H.up || H.caps;
 	H.up = false;
 	H.caps = 0;
+	H.regions = false;
 	struct hw_obj *o;
-	wl_list_for_each(o, &H.objs, link) o->announced = false;
+	wl_list_for_each(o, &H.objs, link) {
+		o->announced = false;
+		struct hw_region *r;
+		wl_list_for_each(r, &o->regions, link) r->announced = false;
+	}
 	if (was) caps_changed();
 	if (!was && ++H.fails >= 5) return;     /* it can't start: raw strokes only, until the next login */
 	if (!H.timer) H.timer = wl_event_loop_add_timer(H.loop, respawn, NULL);
@@ -504,9 +957,15 @@ static struct hw_obj *obj_from(struct wl_resource *r)
 	return wl_resource_get_user_data(r);
 }
 
+static void region_detach(struct hw_region *r);
+
 static void obj_free(struct hw_obj *o)
 {
-	if (H.cur == o) { H.cur = NULL; wl_array_release(&H.pts); wl_array_init(&H.pts); }
+	while (!wl_list_empty(&o->regions)) {
+		struct hw_region *r = wl_container_of(o->regions.next, r, link);
+		region_detach(r);       /* before the surface's destroy below */
+	}
+	if (H.cur == o) { H.cur = NULL; H.cur_r = NULL; wl_array_release(&H.pts); wl_array_init(&H.pts); }
 	if (o->idle) wl_event_source_remove(o->idle);
 	if (o->announced) svc_send(msg("destroy", o->sid));
 	wl_list_remove(&o->link);
@@ -534,7 +993,7 @@ static void surface_gone(struct wl_listener *l, void *data)
 	wl_list_remove(&o->surface_destroy.link);
 	wl_list_init(&o->surface_destroy.link);
 	o->surface = NULL;
-	if (H.cur == o) { H.cur = NULL; wl_array_release(&H.pts); wl_array_init(&H.pts); }
+	if (H.cur == o) { H.cur = NULL; H.cur_r = NULL; wl_array_release(&H.pts); wl_array_init(&H.pts); }
 }
 
 static void set_area(struct wl_client *c, struct wl_resource *r, struct wl_resource *region)
@@ -599,7 +1058,7 @@ static void obj_clear(struct wl_client *c, struct wl_resource *r)
 {
 	struct hw_obj *o = obj_from(r);
 	held_clear(o);
-	if (o->announced) svc_send(msg("clear", o->sid));
+	if (o->announced && !o->region_mode) svc_send(msg("clear", o->sid));
 }
 
 static void report(struct wl_client *c, struct wl_resource *r, uint32_t serial, uint32_t action, uint32_t rank,
@@ -607,7 +1066,7 @@ static void report(struct wl_client *c, struct wl_resource *r, uint32_t serial, 
 {
 	struct hw_obj *o = obj_from(r);
 	static const char *names[] = { "picked", "accepted", "corrected", "discarded" };
-	if (!o->announced || !o->text || action > 3) {
+	if (!o->announced || !o->text || action > 3 || o->region_mode) {
 		glassine_handwriting_v1_send_report_done(r, serial, H.fd < 0 || !H.up ?
 			GLASSINE_HANDWRITING_V1_RESULT_UNAVAILABLE : GLASSINE_HANDWRITING_V1_RESULT_STALE);
 		return;
@@ -621,6 +1080,343 @@ static void report(struct wl_client *c, struct wl_resource *r, uint32_t serial, 
 	held_clear(o);                          /* the service forgets the writing too */
 }
 
+/* ---- glassine_handwriting_region_v1 ---- */
+
+static void region_idle(void *data)
+{
+	struct hw_region *r = data;
+	r->idle = NULL;
+	region_sync(r);
+}
+
+/* as changed(): told once the client's requests in hand are all in */
+static void region_changed(struct hw_region *r, bool set)
+{
+	if (set) r->dirty = true;
+	if (!r->idle) r->idle = wl_event_loop_add_idle(H.loop, region_idle, r);
+	if (!r->idle) region_sync(r);
+}
+
+/* the choices in hand go out now (before a stroke, an edit or a restore that follows them) */
+static void region_now(struct hw_region *r)
+{
+	if (r->idle) { wl_event_source_remove(r->idle); r->idle = NULL; }
+	region_sync(r);
+}
+
+static struct hw_region *region_from(struct wl_resource *res)
+{
+	return wl_resource_get_user_data(res);
+}
+
+static void region_drop_stroke(struct hw_region *r)
+{
+	if (H.cur_r != r) return;
+	H.cur = NULL;
+	H.cur_r = NULL;
+	wl_array_release(&H.pts);
+	wl_array_init(&H.pts);
+}
+
+/* the region leaves its object (the object or the region is destroyed): inert from here */
+static void region_detach(struct hw_region *r)
+{
+	region_drop_stroke(r);
+	if (r->idle) { wl_event_source_remove(r->idle); r->idle = NULL; }
+	if (r->announced && r->obj && region_up()) svc_send(rmsg("region_destroy", r));
+	r->announced = false;
+	region_forget(r);
+	if (r->obj) {
+		wl_list_remove(&r->link);
+		wl_list_init(&r->link);
+		r->obj = NULL;
+	}
+}
+
+static void region_free(struct hw_region *r)
+{
+	region_detach(r);
+	wl_list_remove(&r->link);
+	if (r->clip && H.hooks.region_free) H.hooks.region_free(r->clip);
+	free(r->name); free(r->langs);
+	wl_array_release(&r->in_text);
+	wl_array_release(&r->in_state);
+	wl_array_release(&r->rp);
+	held_free(r->rs, r->nrs);
+	free(r);
+}
+
+static void region_resource_destroy(struct wl_resource *res)
+{
+	struct hw_region *r = region_from(res);
+	if (r) region_free(r);
+}
+
+static void r_destroy(struct wl_client *c, struct wl_resource *res)
+{
+	wl_resource_destroy(res);
+}
+
+static void r_set_rect(struct wl_client *c, struct wl_resource *res, wl_fixed_t x, wl_fixed_t y, wl_fixed_t w,
+		       wl_fixed_t h)
+{
+	struct hw_region *r = region_from(res);
+	double nw = wl_fixed_to_double(w), nh = wl_fixed_to_double(h);
+	r->x = wl_fixed_to_double(x);
+	r->y = wl_fixed_to_double(y);
+	if (nw < 0) nw = 0;
+	if (nh < 0) nh = 0;
+	bool resized = nw != r->w || nh != r->h;
+	r->w = nw;
+	r->h = nh;
+	if (resized) region_changed(r, true);         /* a move alone: nothing for the service */
+}
+
+static void r_set_clip(struct wl_client *c, struct wl_resource *res, struct wl_resource *region)
+{
+	struct hw_region *r = region_from(res);
+	if (r->clip && H.hooks.region_free) H.hooks.region_free(r->clip);
+	r->clip = region && H.hooks.region_copy ? H.hooks.region_copy(region) : NULL;
+}
+
+static void r_set_guides(struct wl_client *c, struct wl_resource *res, wl_fixed_t spacing, wl_fixed_t first)
+{
+	struct hw_region *r = region_from(res);
+	double s = wl_fixed_to_double(spacing);
+	r->spacing = s > 0 ? s : 0;
+	r->first = wl_fixed_to_double(first);
+	region_changed(r, true);
+}
+
+static void r_set_context(struct wl_client *c, struct wl_resource *res, uint32_t purpose, uint32_t hints,
+			  const char *langs)
+{
+	struct hw_region *r = region_from(res);
+	r->purpose = purpose;
+	r->hints = hints;
+	free(r->langs);
+	r->langs = strndup(langs, 256);
+	region_changed(r, true);
+}
+
+static void r_set_reading(struct wl_client *c, struct wl_resource *res, uint32_t on)
+{
+	struct hw_region *r = region_from(res);
+	r->reading = on != 0;
+	region_changed(r, true);
+}
+
+static void r_set_neaten(struct wl_client *c, struct wl_resource *res, uint32_t on, wl_fixed_t strength)
+{
+	struct hw_region *r = region_from(res);
+	double s = wl_fixed_to_double(strength);
+	r->neaten = on != 0;
+	r->strength = s < 0 ? 0 : s > 1 ? 1 : s;
+	region_changed(r, true);
+}
+
+static void r_set_layer(struct wl_client *c, struct wl_resource *res, int32_t layer)
+{
+	region_from(res)->layer = layer;
+}
+
+static void region_set_mode(struct hw_region *r, uint32_t mode)
+{
+	mode = mode == GLASSINE_HANDWRITING_V1_MODE_TEXT ? mode : GLASSINE_HANDWRITING_V1_MODE_INK;
+	if (mode == r->mode) return;
+	r->mode = mode;
+	region_now(r);
+	if (!r->announced) return;
+	json_object *m = rmsg("region_mode", r);
+	json_object_object_add(m, "mode", json_object_new_string(mode == GLASSINE_HANDWRITING_V1_MODE_TEXT ? "text" : "ink"));
+	svc_send(m);
+}
+
+static void r_set_mode(struct wl_client *c, struct wl_resource *res, uint32_t mode)
+{
+	region_set_mode(region_from(res), mode);
+}
+
+static void r_add_data(struct wl_client *c, struct wl_resource *res, uint32_t kind, struct wl_array *a)
+{
+	struct hw_region *r = region_from(res);
+	struct wl_array *to = kind == GLASSINE_HANDWRITING_REGION_V1_DATA_KIND_TEXT ? &r->in_text :
+			      kind == GLASSINE_HANDWRITING_REGION_V1_DATA_KIND_STATE ? &r->in_state : NULL;
+	size_t max = kind == GLASSINE_HANDWRITING_REGION_V1_DATA_KIND_TEXT ? MAX_DATA_TEXT : MAX_DATA_STATE;
+	if (!to || to->size + a->size > max) return;            /* past the limit: the rest is dropped */
+	void *p = wl_array_add(to, a->size);
+	if (p) memcpy(p, a->data, a->size);
+}
+
+/* the text gathered, as a string (NULL: not UTF-8), and the gathering emptied */
+static char *take_text(struct hw_region *r)
+{
+	char *t = NULL;
+	if (utf8_ok(r->in_text.data, r->in_text.size)) t = strndup(r->in_text.data ? r->in_text.data : "", r->in_text.size);
+	wl_array_release(&r->in_text);
+	wl_array_init(&r->in_text);
+	return t;
+}
+
+static void r_edit(struct wl_client *c, struct wl_resource *res)
+{
+	struct hw_region *r = region_from(res);
+	char *t = take_text(r);
+	if (!t || !r->obj) { free(t); return; }
+	r->holds = true;
+	region_now(r);
+	if (r->announced) {
+		json_object *m = rmsg("region_edit", r);
+		json_object_object_add(m, "text", json_object_new_string(t));
+		svc_send(m);
+	}
+	free(t);
+}
+
+static void r_report(struct wl_client *c, struct wl_resource *res, uint32_t serial, uint32_t action, uint32_t rank)
+{
+	struct hw_region *r = region_from(res);
+	static const char *names[] = { "picked", "accepted", "corrected", "discarded" };
+	char *t = take_text(r);
+	region_now(r);
+	uint32_t result = UINT32_MAX;
+	if (!r->obj || region_private(r) || action > 2) result = GLASSINE_HANDWRITING_V1_RESULT_NOT_KEPT;
+	else if (!region_up()) result = GLASSINE_HANDWRITING_V1_RESULT_UNAVAILABLE;
+	else if (!r->reading) result = GLASSINE_HANDWRITING_V1_RESULT_NOT_KEPT;
+	else if (!r->announced) result = GLASSINE_HANDWRITING_V1_RESULT_STALE;     /* no writing it was read from */
+	if (result != UINT32_MAX) {
+		glassine_handwriting_region_v1_send_report_done(res, serial, result);
+		free(t);
+		return;
+	}
+	json_object *m = rmsg("region_report", r);
+	json_object_object_add(m, "serial", json_object_new_int64(serial));
+	json_object_object_add(m, "action", json_object_new_string(names[action]));
+	json_object_object_add(m, "rank", json_object_new_int64(rank));
+	json_object_object_add(m, "text", json_object_new_string(t ? t : ""));
+	svc_send(m);
+	free(t);
+}
+
+static void r_restore_points(struct wl_client *c, struct wl_resource *res, struct wl_array *a)
+{
+	struct hw_region *r = region_from(res);
+	const size_t point = 6 * sizeof(int32_t);
+	if (a->size % point || r->rp.size + a->size > MAX_POINTS * point) return;
+	void *p = wl_array_add(&r->rp, a->size);
+	if (p) memcpy(p, a->data, a->size);
+}
+
+static void r_restore_stroke(struct wl_client *c, struct wl_resource *res, uint32_t k)
+{
+	struct hw_region *r = region_from(res);
+	struct held *h = NULL;
+	for (size_t i = 0; i < r->nrs; i++) if (r->rs[i].k == k) { h = &r->rs[i]; wl_array_release(&h->pts); }
+	if (!h) {
+		h = realloc(r->rs, (r->nrs + 1) * sizeof *h);
+		if (!h) { wl_array_release(&r->rp); wl_array_init(&r->rp); return; }
+		r->rs = h;
+		h = &r->rs[r->nrs++];
+	}
+	h->k = k;
+	h->pts = r->rp;                 /* the points gathered move into it */
+	wl_array_init(&r->rp);
+	if (k >= r->next) r->next = k == UINT32_MAX ? k : k + 1;
+}
+
+static void r_restore(struct wl_client *c, struct wl_resource *res)
+{
+	struct hw_region *r = region_from(res);
+	char *value = r->in_text.size ? take_text(r) : NULL;
+	wl_array_release(&r->in_text);
+	wl_array_init(&r->in_text);
+	char *state = r->in_state.size ? b64_encode(r->in_state.data, r->in_state.size) : NULL;
+	wl_array_release(&r->in_state);
+	wl_array_init(&r->in_state);
+	wl_array_release(&r->rp);
+	wl_array_init(&r->rp);
+	struct held *rs = r->rs;
+	size_t nrs = r->nrs;
+	r->rs = NULL;
+	r->nrs = 0;
+	region_drop_stroke(r);
+	if (!r->obj) { held_free(rs, nrs); free(value); free(state); return; }
+	r->holds = true;
+	region_now(r);
+	if (!r->announced) {            /* no service, or private: kept nowhere */
+		held_free(rs, nrs); free(value); free(state);
+		return;
+	}
+	svc_send(restore_msg(r, rs, nrs, value, state));
+	region_forget(r);
+	r->held = rs;
+	r->nheld = nrs;
+	r->value = value;
+	r->state = state;
+}
+
+static const struct glassine_handwriting_region_v1_interface region_impl = {
+	.destroy = r_destroy,
+	.set_rect = r_set_rect,
+	.set_clip = r_set_clip,
+	.set_guides = r_set_guides,
+	.set_context = r_set_context,
+	.set_reading = r_set_reading,
+	.set_neaten = r_set_neaten,
+	.set_layer = r_set_layer,
+	.set_mode = r_set_mode,
+	.add_data = r_add_data,
+	.edit = r_edit,
+	.report = r_report,
+	.restore_points = r_restore_points,
+	.restore_stroke = r_restore_stroke,
+	.restore = r_restore,
+};
+
+static void get_region(struct wl_client *c, struct wl_resource *res, uint32_t id, const char *name)
+{
+	struct hw_obj *o = obj_from(res);
+	struct hw_region *r;
+	wl_list_for_each(r, &o->regions, link) {
+		if (!strcmp(r->name, name)) {
+			wl_resource_post_error(res, GLASSINE_HANDWRITING_V1_ERROR_REGION_NAME,
+					       "a live region of this object already has that name");
+			return;
+		}
+	}
+	r = calloc(1, sizeof *r);
+	if (!r || !(r->name = strndup(name, MAX_NAME))) { free(r); wl_client_post_no_memory(c); return; }
+	r->res = wl_resource_create(c, &glassine_handwriting_region_v1_interface, wl_resource_get_version(res), id);
+	if (!r->res) { free(r->name); free(r); wl_client_post_no_memory(c); return; }
+	if (!o->region_mode) {
+		/* region mode for good: what the object held as one surface is forgotten */
+		if (o->idle) { wl_event_source_remove(o->idle); o->idle = NULL; }
+		if (o->announced) svc_send(msg("destroy", o->sid));
+		o->announced = false;
+		held_clear(o);
+		if (H.cur == o && !H.cur_r) { H.cur = NULL; wl_array_release(&H.pts); wl_array_init(&H.pts); }
+		o->region_mode = true;
+	}
+	r->obj = o;
+	r->rid = ++H.next_rid;
+	r->seq = ++o->region_seq;
+	r->mode = o->mode_all;
+	r->reading = true;
+	wl_array_init(&r->in_text);
+	wl_array_init(&r->in_state);
+	wl_array_init(&r->rp);
+	wl_list_insert(o->regions.prev, &r->link);
+	wl_resource_set_implementation(r->res, &region_impl, r, region_resource_destroy);
+}
+
+static void obj_set_mode(struct wl_client *c, struct wl_resource *res, uint32_t mode)
+{
+	struct hw_obj *o = obj_from(res);
+	o->mode_all = mode == GLASSINE_HANDWRITING_V1_MODE_TEXT ? mode : GLASSINE_HANDWRITING_V1_MODE_INK;
+	struct hw_region *r;
+	wl_list_for_each(r, &o->regions, link) region_set_mode(r, mode);
+}
+
 static const struct glassine_handwriting_v1_interface obj_impl = {
 	.destroy = obj_destroy,
 	.set_area = set_area,
@@ -630,6 +1426,8 @@ static const struct glassine_handwriting_v1_interface obj_impl = {
 	.set_context = set_context,
 	.clear = obj_clear,
 	.report = report,
+	.get_region = get_region,
+	.set_mode = obj_set_mode,
 };
 
 /* ---- glassine_handwriting_manager_v1 ---- */
@@ -655,6 +1453,7 @@ static void get_handwriting(struct wl_client *c, struct wl_resource *r, uint32_t
 	if (!o->res) { free(o); wl_client_post_no_memory(c); return; }
 	o->surface = surface;
 	o->sid = ++H.next_sid;
+	wl_list_init(&o->regions);
 	o->surface_destroy.notify = surface_gone;
 	wl_resource_add_destroy_listener(surface, &o->surface_destroy);
 	wl_list_insert(&H.objs, &o->link);
@@ -692,7 +1491,7 @@ void glassine_hw_init(struct wl_display *display, const struct glassine_hw_hooks
 	wl_list_init(&H.managers);
 	wl_array_init(&H.pts);
 	H.cmd = service ? strdup(service) : NULL;
-	wl_global_create(display, &glassine_handwriting_manager_v1_interface, 1, NULL, mgr_bind);
+	wl_global_create(display, &glassine_handwriting_manager_v1_interface, 2, NULL, mgr_bind);
 	svc_start();
 }
 
@@ -701,7 +1500,11 @@ void glassine_hw_set_per_mm(double per_mm)
 	if (per_mm == H.per_mm) return;
 	H.per_mm = per_mm;
 	struct hw_obj *o;
-	wl_list_for_each(o, &H.objs, link) if (o->announced) send_set(o);
+	wl_list_for_each(o, &H.objs, link) {
+		if (o->announced && !o->region_mode) send_set(o);
+		struct hw_region *r;
+		wl_list_for_each(r, &o->regions, link) if (r->announced) region_send_set(r);
+	}
 }
 
 void glassine_hw_axis(double pressure, double tilt_x, double tilt_y)
@@ -732,27 +1535,80 @@ bool glassine_hw_pen_down(struct wl_resource *surface, double sx, double sy, dou
 	struct hw_obj *o, *hit = NULL;
 	wl_list_for_each(o, &H.objs, link) if (o->surface == surface) hit = o;
 	if (!hit) return false;
-	if (hit->area && H.hooks.region_contains && !H.hooks.region_contains(hit->area, sx, sy)) return false;
+	struct hw_region *top = NULL;
+	if (hit->region_mode) {
+		/* the topmost region the stroke starts in: the highest layer, then the newest */
+		struct hw_region *r;
+		wl_list_for_each(r, &hit->regions, link) {
+			if (sx < r->x || sy < r->y || sx >= r->x + r->w || sy >= r->y + r->h) continue;
+			if (r->clip && H.hooks.region_contains && !H.hooks.region_contains(r->clip, sx, sy)) continue;
+			if (!top || r->layer > top->layer || (r->layer == top->layer && r->seq > top->seq)) top = r;
+		}
+		if (!top || top->mode != GLASSINE_HANDWRITING_V1_MODE_INK) return false;
+	} else if (hit->area && H.hooks.region_contains && !H.hooks.region_contains(hit->area, sx, sy)) {
+		return false;
+	}
 	H.cur = hit;
+	H.cur_r = top;
+	H.rx = top ? top->x : 0;
+	H.ry = top ? top->y : 0;
 	H.ox = lx - sx;
 	H.oy = ly - sy;
 	wl_array_release(&H.pts);
 	wl_array_init(&H.pts);
-	add_point(sx, sy, t);
+	add_point(sx - H.rx, sy - H.ry, t);
 	return true;
 }
 
 void glassine_hw_pen_motion(double lx, double ly, uint32_t t)
 {
-	if (H.cur) add_point(lx - H.ox, ly - H.oy, t);
+	if (H.cur) add_point(lx - H.ox - H.rx, ly - H.oy - H.ry, t);
+}
+
+/* a region's stroke at pen-up: to the app, and to the service when it wants it */
+static void region_pen_up(struct hw_region *r)
+{
+	uint32_t k = r->next;
+	if (r->next < UINT32_MAX) r->next++;
+	const size_t point = 6 * sizeof(int32_t);
+	size_t n = H.pts.size / point;
+	for (size_t i = 0; i < n; i += PART) {
+		struct wl_array a = { .size = (n - i < PART ? n - i : PART) * point, .alloc = 0,
+				      .data = (char *)H.pts.data + i * point };
+		glassine_handwriting_region_v1_send_points(r->res, k, GLASSINE_HANDWRITING_V1_KIND_RAW, &a);
+	}
+	glassine_handwriting_region_v1_send_stroke(r->res, k);
+	r->holds = true;
+	region_now(r);
+	if (!r->announced) return;
+	struct held *h = realloc(r->held, (r->nheld + 1) * sizeof *h);
+	if (h) {
+		r->held = h;
+		h = &r->held[r->nheld++];
+		h->k = k;
+		wl_array_init(&h->pts);
+		wl_array_copy(&h->pts, &H.pts);
+	}
+	json_object *m = rmsg("region_stroke", r);
+	json_object_object_add(m, "k", json_object_new_int64(k));
+	json_object_object_add(m, "points", points_json(&H.pts));
+	svc_send(m);
 }
 
 void glassine_hw_pen_up(uint32_t t)
 {
 	struct hw_obj *o = H.cur;
+	struct hw_region *cr = H.cur_r;
 	if (!o) return;
 	H.cur = NULL;
+	H.cur_r = NULL;
 	(void)t;
+	if (cr) {
+		region_pen_up(cr);
+		wl_array_release(&H.pts);
+		wl_array_init(&H.pts);
+		return;
+	}
 	uint32_t k = o->next++;
 	send_points(o, k, GLASSINE_HANDWRITING_V1_KIND_RAW, &H.pts);
 	glassine_handwriting_v1_send_stroke(o->res, k);
@@ -768,21 +1624,9 @@ void glassine_hw_pen_up(uint32_t t)
 			wl_array_init(&h->pts);
 			wl_array_copy(&h->pts, &H.pts);
 		}
-		json_object *m = msg("stroke", o->sid), *pts = json_object_new_array();
+		json_object *m = msg("stroke", o->sid);
 		json_object_object_add(m, "k", json_object_new_int64(k));
-		const int32_t *p = H.pts.data;
-		size_t n = H.pts.size / (6 * sizeof *p);
-		for (size_t i = 0; i < n; i++, p += 6) {
-			json_object *q = json_object_new_array();
-			json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[0])));
-			json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[1])));
-			json_object_array_add(q, json_object_new_int64((uint32_t)p[2]));
-			json_object_array_add(q, json_object_new_double(p[3] / 65535.0));
-			json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[4])));
-			json_object_array_add(q, json_object_new_double(wl_fixed_to_double(p[5])));
-			json_object_array_add(pts, q);
-		}
-		json_object_object_add(m, "points", pts);
+		json_object_object_add(m, "points", points_json(&H.pts));
 		svc_send(m);
 	}
 	wl_array_release(&H.pts);
