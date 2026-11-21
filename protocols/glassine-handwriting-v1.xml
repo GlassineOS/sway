@@ -28,9 +28,22 @@
     A stroke's points come in parts, so that no message outgrows the wire: zero or more
     points events, each with at most 128 points, then the stroke or neat_stroke event that
     ends them. Strings in events are at most 1024 bytes.
+
+    Version 2 adds writing regions (GlassineOS/handwriting spec 005): any number of
+    handwritten fields on one surface (glassine_handwriting_region_v1), each with its own
+    area, ruled lines, field type, languages, reading and neatening, whose reading is the
+    field's value. An app bound at version 1 never sees any of it and keeps the behaviour
+    above. Payloads that can outgrow a message (a value's text, the saved state, stroke
+    numbers, the outline of a word set in the person's font) travel as data parts of at
+    most 2048 bytes, gathered until the message that takes them.
+
+    Sizes: the compositor gives the service the px per millimetre of the output the pen
+    writes on (GlassineOS/handwriting spec 004 FR-017): from the output's physical size,
+    else from the person's setting for that output; without either the units stay the
+    pen's own and the service applies its documented default density.
   </description>
 
-  <interface name="glassine_handwriting_manager_v1" version="1">
+  <interface name="glassine_handwriting_manager_v1" version="2">
     <description summary="handwriting surfaces">
       On bind the compositor sends capabilities and the languages, then done; again
       whenever they change (the service starts or stops, a letter model appears).
@@ -58,6 +71,7 @@
       <entry name="neaten" value="2" summary="neatened strokes (the service is there)"/>
       <entry name="text" value="4" summary="readings and candidates (the service is there)"/>
       <entry name="letters" value="8" summary="the person has a letter model: neatening pulls letters to it, not only the line"/>
+      <entry name="regions" value="16" since="2" summary="writing regions are read: values, candidates, gestures, word layout (the service is there and reads regions). Only sent to a manager bound at version 2 or later; without it regions still route raw strokes"/>
     </enum>
 
     <event name="capabilities">
@@ -74,12 +88,19 @@
     </event>
   </interface>
 
-  <interface name="glassine_handwriting_v1" version="1">
+  <interface name="glassine_handwriting_v1" version="2">
     <description summary="the pen interface on one surface">
       Choices take effect for strokes that start after them, except set_neaten, which
       also neatens again the writing the surface holds (a change of strength without new
       pen input). Strokes are numbered from 0 per object and never reused; clear empties
       what the object holds without restarting the numbers.
+
+      From version 2 the object can hold writing regions (get_region). Once it has made one,
+      the object is in region mode for good: its own area, guides, choices, clear and report
+      no longer act, it sends no stroke, neat_stroke, reading or candidate events itself,
+      and every stroke goes to the region it starts in (glassine_handwriting_region_v1). A
+      stroke that starts outside every region is not delivered through this interface; the
+      tablet events still reach the app as before.
     </description>
 
     <request name="destroy" type="destructor">
@@ -267,6 +288,349 @@
     <event name="report_done">
       <arg name="serial" type="uint"/>
       <arg name="result" type="uint" enum="result"/>
+    </event>
+    <enum name="error" since="2">
+      <entry name="region_name" value="0" summary="a live region of this object already has that name"/>
+    </enum>
+
+    <request name="get_region" since="2">
+      <description summary="a new writing region on the surface">
+        A handwritten field of its own, named by the app (UTF-8, at most 256 bytes, unique
+        among this object's live regions). It starts in the mode set_mode last gave all
+        regions (ink at first), with an empty rectangle (it takes no stroke until
+        set_rect), no clip, no guides, purpose normal, the person's languages, reading on,
+        neatening off, layer 0. The object enters region mode (above). A region costs the
+        handwriting service nothing until it holds writing.
+      </description>
+      <arg name="id" type="new_id" interface="glassine_handwriting_region_v1"/>
+      <arg name="name" type="string"/>
+    </request>
+
+    <enum name="mode" since="2">
+      <entry name="ink" value="0" summary="the field takes pen strokes"/>
+      <entry name="text" value="1" summary="the field is a text field the system's keyboard edits; it takes no pen strokes"/>
+    </enum>
+
+    <request name="set_mode" since="2">
+      <description summary="every region of the surface into a mode">
+        As glassine_handwriting_region_v1.set_mode on each live region, and the mode regions
+        made later start in.
+      </description>
+      <arg name="mode" type="uint" enum="mode"/>
+    </request>
+  </interface>
+
+  <interface name="glassine_handwriting_region_v1" version="2">
+    <description summary="a writing region: one handwritten field on a surface">
+      A field the person fills by hand (GlassineOS/handwriting spec 005). Its strokes, ruled
+      lines and word layout are in the region's own coordinates: x and y from the region's
+      top left corner (set_rect), so the app can move the region (a scroll, a new layout)
+      without anything in it changing, and a move or a resize never causes its writing to
+      be read again.
+
+      A stroke belongs, whole, to the region it starts in, wherever it ends, and is read
+      only there. Where regions overlap, the one with the highest layer gets it, and of
+      equal layers the one made last. A region in text mode takes no stroke (also not where
+      it covers another). A stroke still being written when its region is destroyed, or
+      its object or surface goes, is dropped: no event is sent for it.
+
+      Strokes are numbered per region and never reused: live strokes from 0 up, each one
+      above the highest number the region has used or been handed back (restore). Points are as in the
+      protocol's description, in region coordinates, and come in points parts as there.
+
+      Every stroke is sent raw at pen-up (stroke), by the compositor itself, also with
+      reading off (a drawing area) and in a private field. With neatening on, neat_stroke
+      follows as on glassine_handwriting_v1. With reading on, the region has a value: its
+      text, sent whole whenever it changes, with which strokes make which word, the words
+      set in the person's font, the strokes that left the field and the saved state, all
+      ended by one value event. At a pause candidates follow.
+
+      Private fields (purpose password or pin, the hints hidden_text or sensitive_data):
+      nothing about the region reaches the handwriting service, no value, candidate,
+      gesture or neat stroke comes, reports answer not_kept; a region that becomes private
+      is forgotten by the service at once. Its raw strokes still come.
+
+      Data parts: data_part events gather, per kind, until the event that takes that kind
+      ends them (word, gone and gesture take strokes, set_word shape, value text and state,
+      candidate text); kinds a message doesn't take stay gathered for the next one that
+      does. add_data requests gather in the same way until the request that takes them
+      (edit and report text, restore text and state).
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="the field is gone">
+        The handwriting service forgets its writing at once, no event is sent for it
+        afterwards, and a stroke being written in it is dropped.
+      </description>
+    </request>
+
+    <request name="set_rect">
+      <description summary="where the region lies on the surface">
+        The region's top left corner on the surface and its size (wl_fixed, surface
+        coordinates). The region takes strokes that start inside this rectangle and inside
+        the clip. A move changes nothing else; a new size changes the region's writing area
+        for strokes that follow, and what it holds stays.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+    </request>
+
+    <request name="set_clip">
+      <description summary="where on the surface the region takes strokes">
+        A wl_region in surface coordinates, copied: the part of the region that is visible
+        (the rest scrolled out of view or covered). Null (the start): the whole rectangle.
+        Stated in surface coordinates, a viewport's clip stays the same while its content
+        scrolls.
+      </description>
+      <arg name="region" type="object" interface="wl_region" allow-null="true"/>
+    </request>
+
+    <request name="set_guides">
+      <description summary="the field's ruled lines, in region coordinates">
+        As glassine_handwriting_v1.set_guides, with first in region coordinates. A ruled
+        line is a size reference only for this region; a region never takes a line from
+        another. spacing 0: none.
+      </description>
+      <arg name="spacing" type="fixed"/>
+      <arg name="first" type="fixed"/>
+    </request>
+
+    <request name="set_context">
+      <description summary="the field's type and languages">
+        purpose and hints as in zwp_text_input_v3; languages a comma-separated list in order
+        (empty: the person's setting). Applies to writing that follows.
+      </description>
+      <arg name="purpose" type="uint" enum="glassine_handwriting_v1.purpose"/>
+      <arg name="hints" type="uint"/>
+      <arg name="languages" type="string"/>
+    </request>
+
+    <request name="set_reading">
+      <description summary="reading on or off">
+        Off: no value, candidates or gestures for writing that follows; the region still
+        gets its raw strokes (a drawing area), and neat strokes with neatening on.
+      </description>
+      <arg name="enabled" type="uint"/>
+    </request>
+
+    <request name="set_neaten">
+      <description summary="neatening on or off, and its strength">
+        As glassine_handwriting_v1.set_neaten; it also applies to the writing the region
+        holds.
+      </description>
+      <arg name="enabled" type="uint"/>
+      <arg name="strength" type="fixed"/>
+    </request>
+
+    <request name="set_layer">
+      <description summary="the stacking order: higher is on top (0 at the start)"/>
+      <arg name="layer" type="int"/>
+    </request>
+
+    <request name="set_mode">
+      <description summary="ink mode or text mode">
+        In text mode the region takes no pen strokes; the app shows its value as an
+        ordinary text field edited through the system's text input (zwp_text_input_v3) for
+        the region's field type and languages. Before going back to ink mode the app sends
+        the edited text with edit.
+      </description>
+      <arg name="mode" type="uint" enum="glassine_handwriting_v1.mode"/>
+    </request>
+
+    <enum name="data_kind">
+      <entry name="text" value="0" summary="UTF-8 text"/>
+      <entry name="state" value="1" summary="the saved state: opaque bytes the app keeps and hands back unchanged"/>
+      <entry name="strokes" value="2" summary="stroke numbers, uint32 each (events only)"/>
+      <entry name="shape" value="3" summary="a path in region coordinates (path_op), int32 each (events only)"/>
+    </enum>
+
+    <request name="add_data">
+      <description summary="a part of a text or a saved state for the next request taking it">
+        At most 2048 bytes a part; the parts of one kind add up until edit, report or
+        restore takes them. Text: at most 65536 bytes in all; state: at most 1 MiB.
+      </description>
+      <arg name="kind" type="uint" enum="data_kind"/>
+      <arg name="bytes" type="array"/>
+    </request>
+
+    <request name="edit">
+      <description summary="the person's text for the field, set by keyboard">
+        The text gathered in data parts (empty: none) becomes the region's value: a
+        correction of the words whose ink it changed. Unchanged words keep their ink,
+        edited and added ones are set in the person's font; a value event follows with the
+        word layout.
+      </description>
+    </request>
+
+    <request name="report">
+      <description summary="what the person did with the field's writing">
+        serial names a value (accepted: the value as it is; corrected: the text gathered in
+        data parts) or the candidates of one (picked: rank, 0 the best). It applies to the
+        writing that value was read from, never to writing added later, and the ink stays
+        the field's content. discarded is answered not_kept. The answer is report_done.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="action" type="uint" enum="glassine_handwriting_v1.action"/>
+      <arg name="rank" type="uint"/>
+    </request>
+
+    <request name="restore_points">
+      <description summary="a part of a stored stroke's points">
+        At most 128 points, in region coordinates, as in the protocol's description; the
+        parts add up until restore_stroke.
+      </description>
+      <arg name="points" type="array"/>
+    </request>
+
+    <request name="restore_stroke">
+      <description summary="a stored stroke, with its number">
+        The points gathered since the last restore_stroke are the stored stroke numbered
+        stroke (the number it had when the app kept it). It waits for restore.
+      </description>
+      <arg name="stroke" type="uint"/>
+    </request>
+
+    <request name="restore">
+      <description summary="hand back stored ink">
+        The region's writing is replaced by the stored strokes given since the last restore
+        (none: the region is emptied), with the value (text data parts) and the saved state
+        (state data parts) the app kept with them, or neither (strokes alone). The strokes
+        are read with the model the system has now; words the saved state names as
+        confirmed or edited stay as they are. A value event follows. No stroke event is
+        sent for stored strokes; neat_stroke is, with neatening on. A stroke number given
+        twice keeps the last.
+      </description>
+    </request>
+
+    <event name="points">
+      <description summary="a part of a stroke's points">
+        As glassine_handwriting_v1.points, in region coordinates.
+      </description>
+      <arg name="stroke" type="uint"/>
+      <arg name="kind" type="uint" enum="glassine_handwriting_v1.kind"/>
+      <arg name="points" type="array"/>
+    </event>
+
+    <event name="stroke">
+      <description summary="a raw stroke, sent when the pen lifts">
+        Every stroke that starts in the region, as the tablet reported it, in region
+        coordinates: the points events just before it.
+      </description>
+      <arg name="stroke" type="uint"/>
+    </event>
+
+    <event name="neat_stroke">
+      <description summary="the neatened version of a stroke">
+        As glassine_handwriting_v1.neat_stroke.
+      </description>
+      <arg name="stroke" type="uint"/>
+      <arg name="how" type="uint" enum="glassine_handwriting_v1.how"/>
+    </event>
+
+    <event name="data_part">
+      <description summary="a part of a payload for the next event taking it">
+        At most 2048 bytes a part, gathered per kind as in the interface's description.
+      </description>
+      <arg name="kind" type="uint" enum="data_kind"/>
+      <arg name="bytes" type="array"/>
+    </event>
+
+    <event name="word">
+      <description summary="a word of the value shown as the person's ink">
+        Part of the value serial: the bytes start to start + length of its text are this
+        word, made of the strokes gathered in strokes data. The app draws them moved by dx,
+        dy (wl_fixed, region coordinates; 0 unless an edited word before it on its line
+        changed width), raw or neat as the region's neatening has it.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="start" type="uint"/>
+      <arg name="length" type="uint"/>
+      <arg name="dx" type="fixed"/>
+      <arg name="dy" type="fixed"/>
+    </event>
+
+    <enum name="path_op">
+      <entry name="move" value="0" summary="x y"/>
+      <entry name="line" value="1" summary="x y"/>
+      <entry name="quad" value="2" summary="control x y, end x y"/>
+      <entry name="cubic" value="3" summary="two controls, end: six coordinates"/>
+      <entry name="close" value="4" summary="no coordinates"/>
+    </enum>
+
+    <event name="set_word">
+      <description summary="a word of the value set in the person's font">
+        Part of the value serial: the bytes start to start + length of its text are this
+        word, which has no ink (typed, or edited by keyboard). Its outline is the shape
+        gathered in shape data: path_op codes, each followed by its coordinates (wl_fixed,
+        region coordinates), filled with the non-zero rule. x, y, width, height: its box,
+        in region coordinates. The app draws it; it never needs the font itself.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="start" type="uint"/>
+      <arg name="length" type="uint"/>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+    </event>
+
+    <event name="gone">
+      <description summary="strokes that left the field for good">
+        Part of the value serial: the strokes gathered in strokes data were struck out,
+        replaced by an edit or made a gesture. They are no longer the region's; the app
+        stops drawing and keeping them.
+      </description>
+      <arg name="serial" type="uint"/>
+    </event>
+
+    <event name="value">
+      <description summary="the field's value, whole, with its layout">
+        Ends the value serial (it grows with each value of the region): its text is the
+        text gathered in data parts (lines separated by a newline, in reading order), its
+        saved state the state gathered. The word, set_word and gone events of serial just
+        before it, in the text's order, are its layout; together they are one update, drawn
+        in one go.
+      </description>
+      <arg name="serial" type="uint"/>
+    </event>
+
+    <event name="candidate">
+      <description summary="one ranked alternative for the value serial, at a pause">
+        Its text the text gathered in data parts. rank 0 is the best; origin and fit as on
+        glassine_handwriting_v1.candidate. A pick (report picked) becomes the value.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="rank" type="uint"/>
+      <arg name="origin" type="uint" enum="glassine_handwriting_v1.origin"/>
+      <arg name="fit" type="uint"/>
+    </event>
+
+    <event name="candidates_done">
+      <description summary="the candidates above (count of them) are complete"/>
+      <arg name="serial" type="uint"/>
+      <arg name="count" type="uint"/>
+    </event>
+
+    <enum name="gesture_kind">
+      <entry name="strike" value="0" summary="a strike-through: deletes the words it covers"/>
+      <entry name="scratch" value="1" summary="a scratch-out: deletes the words it covers"/>
+      <entry name="caret" value="2" summary="marks where the next writing is inserted"/>
+    </enum>
+
+    <event name="gesture">
+      <description summary="a gesture the person wrote in the field">
+        Made of the strokes gathered in strokes data; it acts only in this region and its
+        strokes are never part of the value. Its effect comes with the value serial.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="gesture" type="uint" enum="gesture_kind"/>
+    </event>
+
+    <event name="report_done">
+      <arg name="serial" type="uint"/>
+      <arg name="result" type="uint" enum="glassine_handwriting_v1.result"/>
     </event>
   </interface>
 </protocol>
