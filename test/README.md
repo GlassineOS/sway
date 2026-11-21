@@ -38,6 +38,15 @@ where a stroke a region takes inks past the region's edge. SWAY: a `build-glassi
 architecture (as in CI); without it the container builds this tree. Logs go to
 `build-test/ink-popup/`.
 
+`content-hint-test.sh [SWAY]` runs too (Docker, as `ink-popup-test.sh`): the content hints of
+the ink protocol's version 4. This sway headless with the glassine-epd output,
+`glassine-epd-sink.c` as the panel daemon and `content-hint-client.c` as the app: a commit said
+to be a page or a step of a movement has its kind and the window's place in its FRAME (also
+with the output turned), the commit after it says nothing and its FRAME is byte for byte as
+long as before version 4, an unknown value and a version 3 client say nothing, and a hint for
+a commit that changes nothing is not carried to the next one. The dead band's part (a page
+frame skips it) needs the GLES grey output and is not covered here.
+
 `handwriting-test.sh [SWAY]` runs too (Docker, as `ink-popup-test.sh`): the pen interface's
 global, its capabilities without the service, and with a stand-in service that the test
 starts through sway (its channel on fd 3) the capabilities it gives, the surface it is told

@@ -13,6 +13,12 @@ void glassine_ink_update(struct sway_output *output);
  * writing surface) */
 bool glassine_ink_has_areas(struct wlr_surface *s);
 
+/* what the apps said their commits since this output's last frame are (the ink protocol's
+ * set_content): 0 = nothing, else the kind (glassine_ink_surface_v1.content) and in *box
+ * where, in the coordinates of the output's frame buffer. Taking it forgets it */
+struct wlr_box;
+uint32_t glassine_ink_content_take(struct sway_output *output, struct wlr_box *box);
+
 /* the writing regions (glassine-handwriting.c) moved or changed: send the areas again */
 void glassine_ink_changed(void);
 
