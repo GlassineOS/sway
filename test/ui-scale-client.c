@@ -20,6 +20,8 @@
  *                      S's buffer (its first W x H pixels) with the output's
  *                      pixels from X Y
  *   px OUT X Y         print the output's pixel
+ *   turn DEGREES       the outputs' transform (90, 180, 270): check and px then
+ *                      count in the turned output's pixels
  *   dump OUT FILE      write the screenshot (width, height, then XRGB rows)
  *   ptr X Y EW EH      pointer to X Y of an extent EW x EH (the layout's size,
  *                      or a multiple of it for positions between layout px)
@@ -407,10 +409,25 @@ static int take_shot(const char *name)
 	return shot.done == 1;
 }
 
-static uint32_t shot_px(int x, int y)
+/* the output's transform (turn): checks count in the turned output's pixels */
+static int turn;
+static int shot_w(void) { return turn % 180 ? (int)shot.h : (int)shot.w; }
+static int shot_h(void) { return turn % 180 ? (int)shot.w : (int)shot.h; }
+
+static uint32_t raw_px(int x, int y)
 {
 	if (shot.flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT) y = shot.h - 1 - y;
 	return shot.data[y * (shot.stride / 4) + x] | 0xff000000u;
+}
+
+static uint32_t shot_px(int x, int y)
+{
+	switch (turn) {
+	case 270: return raw_px(y, shot_w() - 1 - x);
+	case 180: return raw_px(shot_w() - 1 - x, shot_h() - 1 - y);
+	case 90: return raw_px(shot_h() - 1 - y, x);
+	}
+	return raw_px(x, y);
 }
 
 /* ---- sway IPC ---- */
@@ -485,6 +502,8 @@ static void command(char *l)
 		wl_subsurface_set_desync(sub);
 		draw(SUB, 0);
 		wl_surface_commit(surfs[WIN].s);
+	} else if (sscanf(l, "turn %d", &a) == 1) {
+		turn = a;
 	} else if (!strcmp(l, "unsub")) {
 		wl_subsurface_destroy(sub);
 		surf_destroy(SUB);
@@ -527,7 +546,7 @@ static void command(char *l)
 			for (int y = 0; y < h; y++) {
 				for (int x = 0; x < w; x++) {
 					int X = a + x, Y = b + y;
-					if (X >= 0 && Y >= 0 && X < (int)shot.w && Y < (int)shot.h &&
+					if (X >= 0 && Y >= 0 && X < shot_w() && Y < shot_h() &&
 					    shot_px(X, Y) == pattern(id, f, x, y)) continue;
 					if (!bad++) {
 						fx = x;
@@ -540,14 +559,14 @@ static void command(char *l)
 			if (!bad) {
 				printf("check %s %s ok %d %d %dx%d\n", o, s, a, b, w, h);
 			} else {
-				int X = a + fx, Y = b + fy, in = X >= 0 && Y >= 0 && X < (int)shot.w && Y < (int)shot.h;
+				int X = a + fx, Y = b + fy, in = X >= 0 && Y >= 0 && X < shot_w() && Y < shot_h();
 				printf("check %s %s bad %d %d %dx%d: %d pixels, first at %d %d: %06x, expected %06x, last at %d %d\n",
 				       o, s, a, b, w, h, bad, fx, fy, in ? shot_px(X, Y) & 0xffffff : 0,
 				       pattern(id, f, fx, fy) & 0xffffff, lx, ly);
 			}
 		}
 	} else if (sscanf(l, "px %31s %d %d", o, &a, &b) == 3) {
-		if (take_shot(o) && a >= 0 && b >= 0 && a < (int)shot.w && b < (int)shot.h) {
+		if (take_shot(o) && a >= 0 && b >= 0 && a < shot_w() && b < shot_h()) {
 			printf("px %s %d %d %06x\n", o, a, b, shot_px(a, b) & 0xffffff);
 		} else {
 			printf("px %s %d %d none\n", o, a, b);
@@ -559,7 +578,7 @@ static void command(char *l)
 			fwrite(&shot.h, 4, 1, f);
 			for (uint32_t y = 0; y < shot.h; y++) {
 				for (uint32_t x = 0; x < shot.w; x++) {
-					uint32_t v = shot_px(x, y);
+					uint32_t v = raw_px(x, y);
 					fwrite(&v, 4, 1, f);
 				}
 			}
