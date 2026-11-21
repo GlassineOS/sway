@@ -9,7 +9,11 @@ void glassine_ink_init(struct wl_display *display);
 /* after an output commit: send the windows' visible regions when they changed */
 void glassine_ink_update(struct sway_output *output);
 
-/* the surface's client registered ink areas on it (a writing surface) */
+/* the surface's client registered ink areas on it, or writing regions in ink mode (a
+ * writing surface) */
 bool glassine_ink_has_areas(struct wlr_surface *s);
+
+/* the writing regions (glassine-handwriting.c) moved or changed: send the areas again */
+void glassine_ink_changed(void);
 
 #endif
