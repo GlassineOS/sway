@@ -11,9 +11,14 @@
     removes every part covered by other surfaces (menus, the shell, the
     keyboard, other windows). Without it, an app whose per-app setting has ink
     on gets its whole visible window.
+
+    Since version 4 an app can also say what a commit of its surface is
+    (glassine_ink_surface_v1.set_content): a whole new page, or a step of a
+    movement it drives. The panel then needs no time to find that out by
+    watching the frames.
   </description>
 
-  <interface name="glassine_ink_manager_v1" version="3">
+  <interface name="glassine_ink_manager_v1" version="4">
     <request name="destroy" type="destructor"/>
 
     <request name="get_ink_surface">
@@ -48,7 +53,7 @@
     </request>
   </interface>
 
-  <interface name="glassine_ink_surface_v1" version="3">
+  <interface name="glassine_ink_surface_v1" version="4">
     <request name="destroy" type="destructor">
       <description summary="back to the window's default (its per-app setting)"/>
     </request>
@@ -111,9 +116,41 @@
       <arg name="width_min" type="fixed"/>
       <arg name="width_max" type="fixed"/>
     </request>
+
+    <enum name="content" since="4">
+      <entry name="none" value="0" summary="nothing said: the panel decides as for any surface"/>
+      <entry name="page" value="1" summary="the commit replaces what the surface showed there: a new page, complete"/>
+      <entry name="motion" value="2" summary="the commit is one step of a movement the app drives (a drag, a scroll)"/>
+    </enum>
+
+    <request name="set_content" since="4">
+      <description summary="what the next commit is">
+        Says what the next wl_surface.commit of this surface is, for the
+        panel's choice of refresh. Double-buffered, and for that one commit
+        only: the commits after it are none again unless set_content is sent
+        before each of them. It covers the surface's damage of that commit.
+
+        page: the app shows a new picture in place of the old one (another
+        view, another page of a book, a dialog drawn by the app itself) and
+        the picture is complete. The panel shows it at once and exactly, in
+        one refresh: it neither waits for more frames of a transition nor
+        treats the change as movement.
+
+        motion: the commit is one of a row of steps (something dragged, a
+        scroll, an animation) and more follow. The panel shows the steps
+        fast and coarse, and brings the picture to its exact greys when the
+        first commit without motion arrives on the surface, or when no more
+        come.
+
+        none, and every value this version does not know: as without the
+        request. A hint is advice: a compositor or panel that cannot follow
+        it shows the commit as any other.
+      </description>
+      <arg name="content" type="uint" enum="content"/>
+    </request>
   </interface>
 
-  <interface name="glassine_ink_brush_v1" version="3">
+  <interface name="glassine_ink_brush_v1" version="4">
     <description summary="a declarative pen-preview brush">
       Limits (a protocol error past them): tip size 1..64 px, 1..16 variants,
       at most 8 brushes per client in use at once (selected on a surface).

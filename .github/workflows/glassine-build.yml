@@ -13,6 +13,7 @@ jobs:
       - run: sh test/ink-popup-test.sh "$PWD/out/sway-glassine"
       - run: sh test/handwriting-test.sh "$PWD/out/sway-glassine"
       - run: sh test/ui-scale-test.sh "$PWD/out/sway-glassine"
+      - run: sh test/content-hint-test.sh "$PWD/out/sway-glassine"
       - run: sudo apt-get install -y -q libwayland-dev libjson-c-dev && sh test/handwriting-standin.sh
       - run: sh test/handwriting-regions-test.sh
       - run: sh test/output-density-test.sh
