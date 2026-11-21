@@ -1,7 +1,7 @@
 # The handwriting service's channel: writing regions
 
 What `sway/glassine-handwriting.c` sends the handwriting service and takes from it for the
-writing regions of the pen interface's version 2 (`protocols/glassine-handwriting-v1.xml`,
+writing regions of the pen interface's version 2 and its display of version 3 (`protocols/glassine-handwriting-v1.xml`,
 GlassineOS/handwriting spec 005), in addition to the channel that GlassineOS/handwriting's
 `docs/service.md` ("The compositor's channel") describes. JSON objects, one per line, as
 there; neither side waits for an answer.
@@ -20,7 +20,7 @@ service; the pen interface's `regions` capability is off.
 |---|---|---|
 | `surface` | `s`, `sandbox` or `pid` | as before, sent before the surface's first region. A surface in region mode gets no `set`, `stroke`, `clear` or `report`; its `destroy` ends its regions too. A surface that was used without regions first gets `destroy` when it makes its first region, and `surface` again with that region |
 | `region` | `s`, `r`, `name` | a region that holds writing (its first stroke, edit or restore) and wants the service (reading or neatening on, not private). An empty region is never sent (FR-007) |
-| `region_set` | `s`, `r`, `reading`, `neaten`, `strength`, `purpose`, `hints`, `languages`, `guides` ([spacing, first]), `size` ([w, h]: the writing area is [0, 0, w, h]), `units` | right after `region`, and again when a choice, the size or the units change. A move alone sends nothing (FR-003, SC-004) |
+| `region_set` | `s`, `r`, `reading`, `neaten`, `strength`, `purpose`, `hints`, `languages`, `guides` ([spacing, first]), `size` ([w, h]: the writing area is [0, 0, w, h]), `units`, `display` (`set`; absent: `ink`) | right after `region`, and again when a choice, the size, the units or the display change. A move alone sends nothing (FR-003, SC-004) |
 | `region_mode` | `s`, `r`, `mode` (`ink`, `text`) | the region's mode changed; also right after `region_set` for a region announced in text mode |
 | `region_stroke` | `s`, `r`, `k`, `points` ([x, y, t, pressure, tilt_x, tilt_y]) | a raw stroke, at pen-up |
 | `region_edit` | `s`, `r`, `text` | the person's keyboard text: the region's new value, a correction of the words whose ink it changed (FR-017) |
@@ -34,7 +34,7 @@ service; the pen interface's `regions` capability is off.
 |---|---|---|
 | `hello` | as before, plus `regions` (true) | the service reads regions |
 | `region_neat` | `s`, `r`, `k`, `how` (`kept`, `line`, `pulled`), `points` ([x, y] per raw point) | a neatened stroke, a raw or a restored one; passed on only while the region's neatening is on |
-| `region_value` | `s`, `r`, `serial`, `text`, `words`, `gone` ([k]), `state` (base64) | the region's whole value and its layout, one update. `serial` grows with each value of the region. `words` in the text's order: an ink word `{start, length, strokes: [k], dx, dy}`, a set word `{start, length, box: [x0, y0, x1, y1], path}`; `start` and `length` in UTF-8 bytes of `text`. `gone`: strokes that left the region for good; the compositor stops holding them |
+| `region_value` | `s`, `r`, `serial`, `text`, `words`, `gone` ([k]), `state` (base64) | the region's whole value and its layout, one update. `serial` grows with each value of the region. `words` in the text's order: an ink word `{start, length, strokes: [k], dx, dy}`, with the display `set` also its `box` and `path` (the word shown set: `word_shown_set` to a client of version 3, `word` to an older one), a set word `{start, length, box: [x0, y0, x1, y1], path}`; `start` and `length` in UTF-8 bytes of `text`. `gone`: strokes that left the region for good; the compositor stops holding them |
 | `region_candidates` | `s`, `r`, `serial` (the value's), `items` ([{`text`, `from`, `fit`}]) | the ranked alternatives at a pause |
 | `region_gesture` | `s`, `r`, `serial` (the value that carries its effect), `kind` (`strike`, `scratch`, `caret`), `strokes` ([k]) | a gesture written in the region |
 | `region_report` | `s`, `r`, `serial`, `result` (as `report`) | the answer to a `region_report` |
@@ -42,7 +42,7 @@ service; the pen interface's `regions` capability is off.
 `path`: a flat array of ops, each a letter followed by its coordinates: `"M", x, y`,
 `"L", x, y`, `"Q", cx, cy, x, y`, `"C", c1x, c1y, c2x, c2y, x, y`, `"Z"`; filled with the
 non-zero rule. A value whose text isn't UTF-8 or whose state isn't base64 is dropped, as is a
-set word whose path doesn't parse.
+set word whose path doesn't parse; an ink word whose path doesn't parse comes as its ink.
 
 ## A service restart
 

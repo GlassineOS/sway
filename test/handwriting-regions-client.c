@@ -1,5 +1,5 @@
 /* handwriting-regions-client.c — a client of glassine_handwriting_v1's writing regions
- * (version 2) for handwriting-regions-test.py. Commands on stdin, one per line; what the
+ * (version 2, the display of version 3) for handwriting-regions-test.py. Commands on stdin, one per line; what the
  * compositor sends on stdout, one line per event:
  *
  *   surface                          a surface (the stand-in's surface 0) and its object
@@ -11,13 +11,15 @@
  *   neaten NAME 0|1 STRENGTH         set_neaten
  *   layer NAME L                     set_layer
  *   mode NAME 0|1                    set_mode (0 ink, 1 text); modeall 0|1: the object's
+ *   display NAME 0|1                 set_display (0 ink, 1 set; version 3)
  *   edit NAME TEXT                   the text, then edit; long NAME N: edit with N bytes
  *   report NAME SERIAL ACTION RANK [TEXT]
  *   restore NAME K,K… VALUE|- STATE|-  stored strokes K (3 points each) and restore
  *   destroy NAME                     the region's destroy
  *   sync                             a round trip, then "synced"
  *
- * Run with -1 it binds the manager at version 1, prints its capabilities and stops. */
+ * Run with -1 it binds the manager at version 1, prints its capabilities and stops; with
+ * -2 it binds version 2 (no display). */
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +34,7 @@ static struct wl_display *dpy;
 static struct wl_compositor *comp;
 static struct glassine_handwriting_manager_v1 *mgr;
 static struct glassine_handwriting_v1 *hw;
-static uint32_t caps, version = 2;
+static uint32_t caps, version = 3;
 
 struct reg {
 	char name[64];
@@ -124,6 +126,23 @@ static void r_set_word(void *d, struct glassine_handwriting_region_v1 *r, uint32
 	wl_array_release(&s);
 }
 
+static void r_shown(void *d, struct glassine_handwriting_region_v1 *r, uint32_t serial, uint32_t start,
+		    uint32_t len, wl_fixed_t x, wl_fixed_t y, wl_fixed_t w, wl_fixed_t h)
+{
+	struct reg *g = d;
+	struct wl_array s, k;
+	take(&g->shape, &s);
+	take(&g->strokes, &k);
+	int32_t *q = s.data;
+	printf("shownword %s %u %u %u %.2f %.2f %.2f %.2f shape=%zu op0=%d", g->name, serial, start, len,
+	       wl_fixed_to_double(x), wl_fixed_to_double(y), wl_fixed_to_double(w), wl_fixed_to_double(h),
+	       s.size / 4, s.size ? q[0] : -1);
+	print_strokes(&k);
+	printf("\n");
+	wl_array_release(&s);
+	wl_array_release(&k);
+}
+
 static void r_gone(void *d, struct glassine_handwriting_region_v1 *r, uint32_t serial)
 {
 	struct reg *g = d;
@@ -183,7 +202,7 @@ static void r_report_done(void *d, struct glassine_handwriting_region_v1 *r, uin
 
 static const struct glassine_handwriting_region_v1_listener rl_ = {
 	.points = r_points, .stroke = r_stroke, .neat_stroke = r_neat, .data_part = r_data, .word = r_word,
-	.set_word = r_set_word, .gone = r_gone, .value = r_value, .candidate = r_cand,
+	.set_word = r_set_word, .word_shown_set = r_shown, .gone = r_gone, .value = r_value, .candidate = r_cand,
 	.candidates_done = r_cands_done, .gesture = r_gesture, .report_done = r_report_done,
 };
 
@@ -260,6 +279,8 @@ static void command(char *line)
 		glassine_handwriting_region_v1_set_layer(g->r, atoi(w[2]));
 	} else if (!strcmp(w[0], "mode") && n >= 3) {
 		glassine_handwriting_region_v1_set_mode(g->r, (uint32_t)atoi(w[2]));
+	} else if (!strcmp(w[0], "display") && n >= 3) {
+		glassine_handwriting_region_v1_set_display(g->r, (uint32_t)atoi(w[2]));
 	} else if (!strcmp(w[0], "edit") && rest) {
 		text_parts(g->r, 0, rest, strlen(rest));
 		glassine_handwriting_region_v1_edit(g->r);
@@ -302,6 +323,7 @@ static void command(char *line)
 int main(int argc, char **argv)
 {
 	if (argc > 1 && !strcmp(argv[1], "-1")) version = 1;
+	if (argc > 1 && !strcmp(argv[1], "-2")) version = 2;
 	dpy = wl_display_connect(NULL);
 	if (!dpy) return 1;
 	wl_registry_add_listener(wl_display_get_registry(dpy), &rl, NULL);
