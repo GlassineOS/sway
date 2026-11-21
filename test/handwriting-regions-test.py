@@ -8,6 +8,7 @@ service. Run by handwriting-regions-test.sh, which builds them:
 """
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -75,6 +76,19 @@ def check(name, ok):
         FAILS.append(name)
 
 
+def settle(path, quiet=0.3, most=3.0):
+    """wait until the service's log stops growing (it has logged what came before)"""
+    end = time.time() + most
+    n, since = -1, time.time()
+    while time.time() < end:
+        m = len(service_log(path))
+        if m != n:
+            n, since = m, time.time()
+        elif time.time() - since >= quiet:
+            break
+        time.sleep(0.05)
+
+
 def service_log(path):
     try:
         with open(path) as f:
@@ -96,8 +110,6 @@ class World:
         sock = self.standin.wait(lambda l: l.startswith("socket "))
         env["WAYLAND_DISPLAY"] = sock.split()[1]
         self.env = env
-        # the service's hello arrives before the client binds
-        time.sleep(0.5)
         self.t = 1000
 
     def client(self, *args):
@@ -128,11 +140,11 @@ def main():
     w = World("main")
 
     print("writing regions: capabilities")
+    c = w.client()
+    check("a version 2 manager gets the regions bit (caps 23)", c.wait(lambda l: l == "caps 23", 10) is not None)
     v1 = w.client("-1")
     check("a version 1 manager gets no regions bit (caps 7)", v1.wait(lambda l: l.startswith("caps")) == "caps 7")
     v1.stop()
-    c = w.client()
-    check("a version 2 manager gets the regions bit (caps 23)", c.wait(lambda l: l.startswith("caps")) == "caps 23")
     c.wait(lambda l: l == "ready")
     for cmd in ["surface", "region a 20 30 200 100", "region b 20 130 200 100", "region top 100 80 60 100 1",
                 "neaten a 1 0.5", "sync"]:
@@ -150,6 +162,19 @@ def main():
     check("the word names its stroke", any(l.startswith("word a 1 0 2 ") and l.endswith("strokes=0") for l in c.lines))
     check("the saved state comes with the value", v and "state={\"confirmed\": []} " in v)
     check("candidates at a pause", c.wait(lambda l: l.startswith("cands_done a 1 2")) is not None)
+    w.standin.send("per-mm 7.5")
+    w.standin.wait(lambda l: l == "ok")
+    settle(w.log)
+    check("the units with the output's px per mm reach the region (device:7.5)",
+          any('"op":"region_set"' in l and '"units":"device:7.5"' in l for l in service_log(w.log)))
+
+    for i in range(40):
+        c.send("region e%d %d 2000 10 10" % (i, 20 * i))
+    c.send("sync")
+    c.wait(lambda l: l == "synced")
+    settle(w.log)
+    check("40 empty regions cost the service nothing (no region op)",
+          not any('"name":"e' in l for l in service_log(w.log)))
 
     w.pen(110, 90)
     line = c.wait(lambda l: l.startswith("stroke "))
@@ -181,7 +206,7 @@ def main():
     check("inside the clip it does (b 0)", line and line.startswith("stroke b 0 "))
 
     print("writing regions: a removed region, text mode, privacy")
-    time.sleep(0.3)                     # the service has logged what came before
+    settle(w.log)
     before = len(service_log(w.log))
 
     def gone():
@@ -233,7 +258,7 @@ def main():
     check("an added word is set in the font, with its outline", sw and " 3 5 " in sw[0] and "shape=12 op0=0" in sw[0])
     check("the replaced ink leaves (gone 1)", any(l.startswith("gone a") and l.endswith("strokes=1") for l in c.lines[-8:]))
 
-    time.sleep(0.3)                     # the service has logged what came before
+    settle(w.log)
     before = len(service_log(w.log))
     c.send("rect a 20 -470 200 100")
     c.send("sync")
@@ -281,6 +306,24 @@ def main():
     c.send("restore r3 2 - -")
     v = c.wait(lambda l: l.startswith("value r3"))
     check("strokes alone are read", v and v.endswith("text=w2"))
+    settle(w.log)
+    rid = None
+    for l in service_log(w.log):
+        m = re.search(r'"op":"region","s":1,"r":(\d+),"name":"r3"', l)
+        if m:
+            rid = m.group(1)
+    c.send("ctx r3 8 0")
+    c.send("sync")
+    c.wait(lambda l: l == "synced")
+    settle(w.log)
+    before = len(service_log(w.log))
+    check("a region that becomes private is forgotten by the service",
+          rid and any('"op":"region_destroy"' in l and '"r":%s}' % rid in l for l in service_log(w.log)))
+    w.pen(30, 425)
+    line = c.wait(lambda l: l.startswith("stroke "))
+    check("and still gets raw strokes", line and line.startswith("stroke r3 3 "))
+    settle(w.log)
+    check("but sends the service none", not any('"r":%s,' % rid in l for l in service_log(w.log)[before:]))
 
     print("writing regions: a service restart")
     out = subprocess.run(["pgrep", "-f", "--", SERVICE + " --pen-fd"], capture_output=True, text=True).stdout.split()
@@ -289,6 +332,10 @@ def main():
     if pid:
         before = len(service_log(w.log))
         os.kill(pid, signal.SIGTERM)
+        time.sleep(0.3)
+        w.pen(30, 320)                      # written while there is no service
+        line = c.wait(lambda l: l.startswith("stroke "))
+        check("a stroke while the service is away still comes (r2 8)", line and line.startswith("stroke r2 8 "))
         end = time.time() + 8
         rs = []
         while time.time() < end and not rs:
@@ -296,6 +343,12 @@ def main():
             rs = [l for l in service_log(w.log)[before:] if '"op":"region_restore"' in l and '"name"' not in l]
         check("the compositor hands the region's ink to the new service", any('"k":0' in l for l in rs))
         check("with the last value and state", any('"value":' in l and '"state":' in l for l in rs))
+        settle(w.log)
+        rs = [l for l in service_log(w.log)[before:] if '"op":"region_restore"' in l]
+        check("with the stroke written while it was away", any('"k":8' in l for l in rs))
+        check("in writing order", any('"k":5' in l and l.index('"k":5') < l.index('"k":7') < l.index('"k":8')
+                                      for l in rs))
+        check("and nothing of the region that became private", not any('"k":2,' in l for l in rs))
     c.stop()
     time.sleep(0.3)
     log = service_log(w.log)
@@ -306,7 +359,7 @@ def main():
     print("writing regions: a service without regions")
     w = World("old", no_regions=True)
     c = w.client()
-    check("no regions bit (caps 7)", c.wait(lambda l: l.startswith("caps")) == "caps 7")
+    check("no regions bit (caps 7)", c.wait(lambda l: l == "caps 7", 10) is not None)
     c.wait(lambda l: l == "ready")
     for cmd in ["surface", "region a 0 0 100 100", "sync"]:
         c.send(cmd)

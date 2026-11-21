@@ -26,7 +26,7 @@
 #include <wayland-client.h>
 #include "glassine-handwriting-v1-client-protocol.h"
 
-#define MAXR 32
+#define MAXR 128
 
 static struct wl_display *dpy;
 static struct wl_compositor *comp;
