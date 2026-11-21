@@ -337,8 +337,13 @@
       A region where it takes strokes is also an ink area of its surface (glassine_ink_v1):
       the panel shows the pen's raw stroke there while it is written, as fast as in any ink
       area, with the brush of the surface's ink object when the app set one. The app
-      registers nothing for it. A surface whose object is in region mode shows that preview
-      only there and in ink areas the app set itself.
+      registers nothing for it. Like the stroke itself, the preview belongs to the stroke's
+      start: a stroke a region takes shows from its first point to its last, also where it
+      runs past the region's edge, as far as the surface's window is visible (not over
+      anything covering it); a stroke that starts where no region takes strokes shows no
+      preview, also where it crosses into a region. A surface whose object is in region
+      mode shows that preview only for strokes starting in its regions and in ink areas the
+      app set itself.
 
       Strokes are numbered per region and never reused: live strokes from 0 up, each one
       above the highest number the region has used or been handed back (restore). Points are as in the

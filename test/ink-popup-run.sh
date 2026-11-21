@@ -23,10 +23,13 @@
 #     over the window's top; the zone goes (the window grows), the popup
 #     commits (ink): it stays where it was, and the next press reaches it
 # 10  writing regions (ink-region-client.c, a window without ink areas of its
-#     own): a region in ink mode is an ink area (S 1, a brush with the eraser
+#     own): a region in ink mode is an ink area (S 2, a brush with the eraser
 #     off), nothing else of the window is; it follows a move without a new
 #     frame, its clip, a text mode region above it cuts it, text mode and
-#     destroy take it away, the app's own areas add to it, many regions fit
+#     destroy take it away, the app's own areas add to it (S 1), a region over
+#     them wins there, many regions fit. Each owner's lines follow an ink win
+#     line with a key that stays while the window lives; a window with regions
+#     also sends its visible region (ink vis), where a stroke a region takes inks
 set -eu
 apk add -q build-base meson ninja pkgconf basu-dev cairo-dev eudev-dev gdk-pixbuf-dev json-c-dev libevdev-dev \
     libinput-dev libxkbcommon-dev linux-pam-dev pango-dev pcre2-dev wayland-dev wayland-protocols curl \
@@ -110,7 +113,7 @@ block() {
 # panel px of APP's rects in the last block
 area() {
     block | awk -v app="$1" '$1 == "ink" && $2 == "r" { if ($9 == app) a += $7 * $8; next }
-        $1 == "ink" && $2 != "brush" { if ($7 == app) a += $5 * $6 } END { print a + 0 }'
+        $1 == "ink" && $2 != "brush" && $2 != "win" && $2 != "vis" { if ($7 == app) a += $5 * $6 } END { print a + 0 }'
 }
 # check: APP's area becomes N within 3 s (sway sends after a frame)
 expect() {
@@ -163,6 +166,8 @@ send "win 400 300"
 wait_log "^ti-enter win"
 expect ink-test 240000 "1 window's ink area"
 expect_line "^ink r [0-9]* 1 0 0 400 600 ink-test\$" "1 window's rect with its brush, S 1"
+expect_line "^ink win [0-9]*\.[0-9]*\$" "1 its owner's key line"
+if block | grep -q "^ink vis "; then echo "FAIL: 1 a visible region without writing regions"; FAIL=1; else echo "ok: 1 no visible region without writing regions"; fi
 # 2: cursor 20,40 2x20 -> popup 160x80 centred on the 400 wide window, below
 # the cursor: 120,60 = panel 240,120 320x160; it covers 80x80 of the ink area
 send "ti 20 40"
@@ -290,7 +295,12 @@ rsend() {
 # the number of APP's rect lines in the last block (with a brush or without)
 lines() {
     block | awk -v app="$1" '$1 == "ink" && $2 == "r" { if ($9 == app) n++; next }
-        $1 == "ink" && $2 != "brush" && $7 == app { n++ } END { print n + 0 }'
+        $1 == "ink" && $2 != "brush" && $2 != "win" && $2 != "vis" && $7 == app { n++ } END { print n + 0 }'
+}
+# the key of the owner whose lines name APP
+key() {
+    block | awk -v app="$1" '$1 == "ink" && $2 == "win" { k = $3; next }
+        $1 == "ink" && (($2 == "r" && $9 == app) || ($2 != "r" && $7 == app)) { print k; exit }'
 }
 rwait "^ready"
 rsend "win 400 300"
@@ -299,10 +309,16 @@ rsend "commit"
 expect_line "^ink 0 0 0 800 600 ink-region\$" "10 no region yet: the whole window, S 0 (inks only with ink=on)"
 rsend "r 0 10 10 100 50"
 expect ink-region 20000 "10 a region in ink mode: an ink area, alone"
-expect_line "^ink r [0-9]* 1 20 20 200 100 ink-region\$" "10 its rect, S 1, at the region"
+expect_line "^ink r [0-9]* 2 20 20 200 100 ink-region\$" "10 its rect, S 2, at the region"
 expect_line "^ink brush [0-9]* 0 0.00 0.00 1.000 1 0.00 0.00 1.000\$" "10 the regions' brush: the app's tip, the eraser off"
+expect_line "^ink vis 0 0 800 600\$" "10 the window's visible region: where a stroke the region takes inks"
+block | awk '$2 == "win" { w = 1; next } $2 == "vis" { if (!w) bad = 1; v = 1; next } $2 == "r" && !v { bad = 1 } END { exit bad }' &&
+    echo "ok: 10 the key line, then the visible region, then the rects" || { echo "FAIL: 10 line order"; FAIL=1; block | sed 's/^/    /'; }
+K10=$(key ink-region)
 rsend "r 0 50 60 100 50"
-expect_line "^ink r [0-9]* 1 100 120 200 100 ink-region\$" "10 a move without a new frame: the rect follows"
+expect_line "^ink r [0-9]* 2 100 120 200 100 ink-region\$" "10 a move without a new frame: the rect follows"
+[ -n "$K10" ] && [ "$(key ink-region)" = "$K10" ] && echo "ok: 10 the owner's key stays ($K10)" ||
+    { echo "FAIL: 10 the key changed: $K10 -> $(key ink-region)"; FAIL=1; }
 rsend "clip 0 50 60 50 50"
 expect ink-region 10000 "10 its clip"
 rsend "clip 0 none"
@@ -323,9 +339,15 @@ expect ink-region 20000 "10 back in ink mode"
 rsend "kill 0"
 rsend "kill 1"
 expect ink-region 0 "10 regions destroyed: no ink (the surface stays in region mode)"
+if block | grep -q "^ink vis "; then echo "FAIL: 10 no rects but a visible region"; FAIL=1; else echo "ok: 10 no rects: nothing of the window sent"; fi
 rsend "r 2 10 10 100 50"
 rsend "inkarea 300 0 100 100"
 expect ink-region 60000 "10 the app's own areas add to the regions"
+expect_line "^ink 1 600 0 200 200 ink-region\$" "10 the app's area, S 1 (no brush of its own)"
+rsend "r 3 320 20 40 40"
+expect_line "^ink r [0-9]* 2 640 40 80 80 ink-region\$" "10 a region over the app's area wins there (S 2)"
+expect ink-region 60000 "10 and adds nothing"
+rsend "kill 3"
 rsend "kill 2"
 expect ink-region 40000 "10 the app's areas alone"
 rsend "many 40"
