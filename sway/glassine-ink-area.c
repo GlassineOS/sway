@@ -6,12 +6,22 @@
  * Sent to glassine-epdd-desktop's FIFO when it changes (and again every 2 s on a commit, so a
  * restarted epdd gets them), in portrait panel px (layout px x the output scale,
  * turned back by glassine-rotd's /run/glassine-rotation, as the popup hints):
- * ink begin / ink brush K ... / ink r K S X Y W H APP (ink S X Y W H APP
- * without a brush) / ink end
- * (S 1 = the app registered areas; K: the window's brush, 0 = the per-app
- * one; brush lines: K TKIND TMIN TMAX TEXP RKIND RMIN RMAX REXP, tip and
- * eraser end, widths in panel px, see glassine-epdd-desktop's ink_line_cmd)
+ * ink begin / ink brush K ... / per owner: ink win KEY, [ink vis X Y W H ...],
+ * ink r K S X Y W H APP (ink S X Y W H APP without a brush) ... / ink end
+ * (S 1 = the app registered areas, S 2 = a writing region's; K: the window's brush,
+ * 0 = the per-app one; brush lines: K TKIND TMIN TMAX TEXP RKIND RMIN RMAX REXP, tip
+ * and eraser end, widths in panel px, see glassine-epdd-desktop's ink_line_cmd)
  * APP as glassine-swayd names it: the app_id, else "class instance", lower case.
+ * KEY names the owner (a window, popup or layer surface) for as long as it lives: its
+ * client's pid and its root surface's object id, "PID.ID". The panel daemon gives a
+ * stroke, as sway does (the tablet's implicit grab, a region takes what starts in it),
+ * to where it starts: a stroke starting outside every ink area never inks, one started
+ * in an area inks only on its owner's part of the panel (GlassineOS/epd epd-inkarea.h).
+ * ink vis lines, the owner's whole visible region, go out for owners with writing
+ * regions: a stroke a region takes inks over the window as far as it is visible, also
+ * past the region's edge (sway hands the app the whole stroke), never over what covers
+ * it. When they don't fit in the message, they are left out (the ink then stops at the
+ * region's edge), before the owner's rects are.
  * An app narrows its window to its canvas with the glassine_ink_v1 protocol
  * (glassine-ink-v1.xml): areas in surface coordinates, intersected with what is
  * visible; such a window is sent with S 1 (it inks without a per-app ink=on).
@@ -37,8 +47,9 @@
  * in the rest of its window: a stroke starting outside every region isn't delivered. The
  * region's rects carry the surface's brush when its client set one, else a brush with the
  * eraser end off (sway gives handwriting no eraser strokes, so the panel would show an
- * erasure the app never gets). Layer surfaces and input-method popups with regions ink
- * as with areas.
+ * erasure the app never gets). Where a region overlaps an area the app registered, the
+ * region's rect wins (a stroke starting there is the region's). Layer surfaces and
+ * input-method popups with regions ink as with areas.
  * Nothing happens when glassine-epdd-desktop isn't there (O_NONBLOCK open fails). */
 #include <ctype.h>
 #include <math.h>
@@ -876,6 +887,31 @@ static long long now_ms(void)
 	return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
 }
 
+/* a region's box (layout px) -> portrait panel px o[4] (glassine-popup-hint.c) */
+static void panel_rect(const pixman_box32_t *r, const struct wlr_box *ob, float sc, int ow, int oh, int rot, int o[4])
+{
+	int b[4] = { (int)((r->x1 - ob->x) * sc), (int)((r->y1 - ob->y) * sc),
+		(int)((r->x2 - r->x1) * sc + 0.999), (int)((r->y2 - r->y1) * sc + 0.999) };
+	switch (rot) {
+	case 270: o[0] = b[1]; o[1] = ow - b[0] - b[2]; o[2] = b[3]; o[3] = b[2]; break;
+	case 90: o[0] = oh - b[1] - b[3]; o[1] = b[0]; o[2] = b[3]; o[3] = b[2]; break;
+	case 180: o[0] = ow - b[0] - b[2]; o[1] = oh - b[1] - b[3]; o[2] = b[2]; o[3] = b[3]; break;
+	default: memcpy(o, b, 4 * sizeof *o);
+	}
+}
+
+/* the owner's KEY: its client's pid and its root surface's object id */
+static void owner_key(struct wlr_surface *s, char *c, size_t len)
+{
+	pid_t pid = 0;
+	uint32_t id = 0;
+	if (s && s->resource) {
+		wl_client_get_credentials(wl_resource_get_client(s->resource), &pid, NULL, NULL);
+		id = wl_resource_get_id(s->resource);
+	}
+	snprintf(c, len, "%d.%u", (int)pid, id);
+}
+
 void glassine_ink_update(struct sway_output *output)
 {
 	static char last[MSG];
@@ -957,7 +993,7 @@ void glassine_ink_update(struct sway_output *output)
 		bk[k] = 0;
 		if (has_hw[k]) {
 			has_sdk[k] = true;      /* a surface in region mode inks only in its areas */
-			pixman_region32_subtract(&hwa[k], &hwa[k], &sdk[k]);
+			pixman_region32_subtract(&sdk[k], &sdk[k], &hwa[k]);    /* a region wins over an area */
 		}
 		if (bs[k] && (vs[k] || has_sdk[k]) && n < (int)sizeof msg - 400) {
 			bk[k] = ++nb;
@@ -981,8 +1017,8 @@ void glassine_ink_update(struct sway_output *output)
 		}
 	}
 	for (int k = 0; k < nv; k++) {
-		char app[128], line[MSG];
-		int ln = 0, nr;
+		char app[128], key[32], line[MSG], vl[MSG];
+		int ln = 0, vn = 0, nr, o[4];
 		if (!vs[k] && !has_sdk[k]) {    /* a popup or layer surface without areas: covers only */
 			pixman_region32_fini(&sdk[k]);
 			pixman_region32_fini(&hwa[k]);
@@ -994,7 +1030,14 @@ void glassine_ink_update(struct sway_output *output)
 		} else {
 			owner_name(os[k], app, sizeof app);
 		}
-		/* the regions' part (not already the app's areas) with their brush, then the rest */
+		owner_key(vs[k] ? vs[k]->surface : os[k], key, sizeof key);
+		/* a surface with regions: its whole visible region, where a stroke a region takes inks */
+		pixman_box32_t *r = pixman_region32_rectangles(&vis[k], &nr);
+		for (int j = 0; has_hw[k] && j < nr && vn < (int)sizeof vl - 200; j++) {
+			panel_rect(&r[j], &ob, sc, ow, oh, rot, o);
+			vn += snprintf(vl + vn, sizeof vl - vn, "ink vis %d %d %d %d\n", o[0], o[1], o[2], o[3]);
+		}
+		/* the regions' part with their brush (S 2), then the rest */
 		pixman_region32_t hv;
 		pixman_region32_init(&hv);
 		pixman_region32_intersect(&hv, &vis[k], &hwa[k]);
@@ -1005,31 +1048,36 @@ void glassine_ink_update(struct sway_output *output)
 		pixman_region32_fini(&sdk[k]);
 		for (int pass = 0; pass < 2; pass++) {
 			pixman_region32_t *rg = pass ? &hv : &vis[k];
-			int kb = pass && !bk[k] ? hb : bk[k];
-			pixman_box32_t *r = pixman_region32_rectangles(rg, &nr);
+			int kb = pass && !bk[k] ? hb : bk[k], sk = pass ? 2 : has_sdk[k];
+			r = pixman_region32_rectangles(rg, &nr);
 			for (int j = 0; j < nr && ln < (int)sizeof line - 200; j++) {
-				int b[4] = { (int)((r[j].x1 - ob.x) * sc), (int)((r[j].y1 - ob.y) * sc),
-					(int)((r[j].x2 - r[j].x1) * sc + 0.999), (int)((r[j].y2 - r[j].y1) * sc + 0.999) }, o[4];
-				switch (rot) {          /* back to portrait px (glassine-popup-hint.c) */
-				case 270: o[0] = b[1]; o[1] = ow - b[0] - b[2]; o[2] = b[3]; o[3] = b[2]; break;
-				case 90: o[0] = oh - b[1] - b[3]; o[1] = b[0]; o[2] = b[3]; o[3] = b[2]; break;
-				case 180: o[0] = ow - b[0] - b[2]; o[1] = oh - b[1] - b[3]; o[2] = b[2]; o[3] = b[3]; break;
-				default: memcpy(o, b, sizeof o);
-				}
+				panel_rect(&r[j], &ob, sc, ow, oh, rot, o);
 				if (kb) {               /* (the plain form without a brush: an older glassine-epdd-desktop still reads it) */
-					ln += snprintf(line + ln, sizeof line - ln, "ink r %d %d %d %d %d %d %s\n", kb, has_sdk[k], o[0], o[1], o[2], o[3], app);
+					ln += snprintf(line + ln, sizeof line - ln, "ink r %d %d %d %d %d %d %s\n", kb, sk, o[0], o[1], o[2], o[3], app);
 				} else {
-					ln += snprintf(line + ln, sizeof line - ln, "ink %d %d %d %d %d %s\n", has_sdk[k], o[0], o[1], o[2], o[3], app);
+					ln += snprintf(line + ln, sizeof line - ln, "ink %d %d %d %d %d %s\n", sk, o[0], o[1], o[2], o[3], app);
 				}
 			}
 		}
 		pixman_region32_fini(&hv);
 		pixman_region32_fini(&vis[k]);
-		/* a window whose rects don't fit is left out (no ink there), never cut */
-		if (n + ln < (int)sizeof msg - 16) {
-			memcpy(msg + n, line, ln);
-			n += ln;
+		if (!ln) {
+			continue;       /* all of it covered: nothing to send */
 		}
+		/* a window whose rects don't fit is left out (no ink there), never cut; its
+		 * visible region goes first (the ink then stops at its regions' edges) */
+		int wn = snprintf(msg + n, sizeof msg - n, "ink win %s\n", key);
+		if (n + wn + vn + ln < (int)sizeof msg - 16) {
+			memcpy(msg + n + wn, vl, vn);
+			n += wn + vn;
+		} else if (n + wn + ln < (int)sizeof msg - 16) {
+			n += wn;
+		} else {
+			msg[n] = 0;
+			continue;
+		}
+		memcpy(msg + n, line, ln);
+		n += ln;
 	}
 	n += snprintf(msg + n, sizeof msg - n, "ink end\n");
 

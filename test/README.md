@@ -31,8 +31,10 @@ position, cut by what is above it and cutting what is below, following it when i
 gone when it unmaps; a layer surface's areas; and that the pointer's press and drag reach
 the popup without moving focus. Then `ink-region-client.c` (a window with writing regions and
 no ink areas of its own): each region in ink mode is an ink area, following a move without a
-new frame, its clip, text mode regions above it, its destruction, the app's own areas and
-many regions at once. SWAY: a `build-glassine.sh` binary for the host's
+new frame, its clip, text mode regions above it, its destruction, the app's own areas (a
+region over them wins) and many regions at once; each owner's lines come after its key line
+(which stays while the window lives), and a window with regions sends its visible region,
+where a stroke a region takes inks past the region's edge. SWAY: a `build-glassine.sh` binary for the host's
 architecture (as in CI); without it the container builds this tree. Logs go to
 `build-test/ink-popup/`.
 
