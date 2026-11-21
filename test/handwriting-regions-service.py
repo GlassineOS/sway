@@ -4,7 +4,8 @@ on fd 3 (--pen-fd 3). It says hello (with "regions" unless STANDIN_NO_REGIONS is
 writes every line it gets to $STANDIN_LOG, and answers the region ops with canned
 results: each stroke k is read as the word "wK"; a stroke starting with pressure above
 0.9 is a strike-through of the stroke before it; an edit keeps the words "wK" it finds as
-ink and sets the others in the font; a restore reads its value, else its strokes."""
+ink and sets the others in the font; a restore reads its value, else its strokes. With
+the display set (region_set) the ink words come with a shape too."""
 import base64
 import json
 import os
@@ -14,7 +15,7 @@ if sys.argv[1:] != ["--pen-fd", "3"]:
     sys.exit(64)
 chan = os.fdopen(3, "r+b", buffering=0)
 log = open(os.environ["STANDIN_LOG"], "a")
-regions = {}   # (s, r) -> {"strokes": [k], "serial": n, "words": [(text, [k])]}
+regions = {}   # (s, r) -> {"strokes": [k], "serial": n, "words": [(text, [k])], "display": "ink"|"set"}
 
 
 def send(m):
@@ -31,6 +32,9 @@ def value(s, r, g, text=None, gone=()):
             pos += 1
         if ks:
             words.append({"start": pos, "length": len(w.encode()), "strokes": ks, "dx": 0, "dy": 0})
+            if g.get("display") == "set":
+                x = 10.0 * len(out)
+                words[-1].update(box=[x, 0, x + 8, 12], path=["M", x, 0, "L", x + 8, 0, "L", x, 12, "Z"])
         else:
             x = 10.0 * len(out)
             words.append({"start": pos, "length": len(w.encode()), "box": [x, 0, x + 8, 12],
@@ -65,7 +69,16 @@ while True:
         op, s, r = m.get("op"), m.get("s"), m.get("r")
         key = (s, r)
         if op == "region":
-            regions[key] = {"strokes": [], "serial": 0, "words": []}
+            # a region named "shown…" starts with the display set (the version 2 client's case)
+            regions[key] = {"strokes": [], "serial": 0, "words": [],
+                            "display": "set" if m.get("name", "").startswith("shown") else "ink"}
+        elif op == "region_set" and key in regions:
+            g = regions[key]
+            d = m.get("display", "ink")
+            if d != g.get("display", "ink"):
+                g["display"] = d
+                if g["words"]:
+                    value(s, r, g)
         elif op == "region_destroy":
             regions.pop(key, None)
         elif op == "region_stroke" and key in regions:

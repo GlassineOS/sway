@@ -37,13 +37,17 @@
     numbers, the outline of a word set in the person's font) travel as data parts of at
     most 2048 bytes, gathered until the message that takes them.
 
+    Version 3 adds a region's display (glassine_handwriting_region_v1.set_display): its
+    words that have ink can be shown set in the person's font, while their strokes stay the
+    region's as written.
+
     Sizes: the compositor gives the service the px per millimetre of the output the pen
     writes on (GlassineOS/handwriting spec 004 FR-017): from the output's physical size,
     else from the person's setting for that output; without either the units stay the
     pen's own and the service applies its documented default density.
   </description>
 
-  <interface name="glassine_handwriting_manager_v1" version="2">
+  <interface name="glassine_handwriting_manager_v1" version="3">
     <description summary="handwriting surfaces">
       On bind the compositor sends capabilities and the languages, then done; again
       whenever they change (the service starts or stops, a letter model appears).
@@ -88,7 +92,7 @@
     </event>
   </interface>
 
-  <interface name="glassine_handwriting_v1" version="2">
+  <interface name="glassine_handwriting_v1" version="3">
     <description summary="the pen interface on one surface">
       Choices take effect for strokes that start after them, except set_neaten, which
       also neatens again the writing the surface holds (a change of strength without new
@@ -320,7 +324,7 @@
     </request>
   </interface>
 
-  <interface name="glassine_handwriting_region_v1" version="2">
+  <interface name="glassine_handwriting_region_v1" version="3">
     <description summary="a writing region: one handwritten field on a surface">
       A field the person fills by hand (GlassineOS/handwriting spec 005). Its strokes, ruled
       lines and word layout are in the region's own coordinates: x and y from the region's
@@ -356,15 +360,19 @@
       set in the person's font, the strokes that left the field and the saved state, all
       ended by one value event. At a pause candidates follow.
 
+      From version 3 the region has a display (set_display): with display set, each word of
+      the value that has ink is shown set in the person's font (word_shown_set) instead of as
+      its strokes; the strokes stay the region's, unchanged, and display ink shows them again.
+
       Private fields (purpose password or pin, the hints hidden_text or sensitive_data):
       nothing about the region reaches the handwriting service, no value, candidate,
       gesture or neat stroke comes, reports answer not_kept; a region that becomes private
       is forgotten by the service at once. Its raw strokes still come.
 
       Data parts: data_part events gather, per kind, until the event that takes that kind
-      ends them (word, gone and gesture take strokes, set_word shape, value text and state,
-      candidate text); kinds a message doesn't take stay gathered for the next one that
-      does. add_data requests gather in the same way until the request that takes them
+      ends them (word, gone and gesture take strokes, set_word shape, word_shown_set strokes
+      and shape, value text and state, candidate text); kinds a message doesn't take stay
+      gathered for the next one that does. add_data requests gather in the same way until the request that takes them
       (edit and report text, restore text and state).
     </description>
 
@@ -600,9 +608,9 @@
       <description summary="the field's value, whole, with its layout">
         Ends the value serial (it grows with each value of the region): its text is the
         text gathered in data parts (lines separated by a newline, in reading order), its
-        saved state the state gathered. The word, set_word and gone events of serial just
-        before it, in the text's order, are its layout; together they are one update, drawn
-        in one go.
+        saved state the state gathered. The word, word_shown_set, set_word and gone events
+        of serial just before it, in the text's order, are its layout; together they are one
+        update, drawn in one go.
       </description>
       <arg name="serial" type="uint"/>
     </event>
@@ -642,6 +650,45 @@
     <event name="report_done">
       <arg name="serial" type="uint"/>
       <arg name="result" type="uint" enum="glassine_handwriting_v1.result"/>
+    </event>
+
+    <enum name="display" since="3">
+      <entry name="ink" value="0" summary="words with ink are shown as their strokes (the start)"/>
+      <entry name="set" value="1" summary="every word of the value is shown set in the person's font"/>
+    </enum>
+
+    <request name="set_display" since="3">
+      <description summary="how the value's words are shown in ink mode">
+        ink (the start): a word with ink comes as word, its strokes. set: a word with ink
+        comes as word_shown_set: its strokes as with word, and its text set in the person's
+        font at its place; the app draws that instead of the strokes and keeps the strokes.
+        Words without ink come as set_word either way. The display changes how the words are
+        shown, never what the region holds: its strokes, value, saved state, reading,
+        samples and reports stay as they are, no stroke leaves the region for it, and
+        nothing is read again. With reading on a value event follows a change, with the
+        layout of the new display. Ink that is no word (a drawing) stays strokes. Gestures
+        act on the words where they are shown.
+      </description>
+      <arg name="display" type="uint" enum="display"/>
+    </request>
+
+    <event name="word_shown_set" since="3">
+      <description summary="a word of the value with ink, shown set in the person's font">
+        Sent instead of word while the region's display is set. Part of the value serial:
+        the bytes start to start + length of its text are this word, made of the strokes
+        gathered in strokes data, which stay the region's (the app keeps them; display ink
+        draws them again). The app draws the word as the shape gathered in shape data, as
+        for set_word: its text in the person's font at its place, filled with the non-zero
+        rule, in place of its strokes. x, y, width, height: the shape's box, in region
+        coordinates.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="start" type="uint"/>
+      <arg name="length" type="uint"/>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
     </event>
   </interface>
 </protocol>
