@@ -67,7 +67,8 @@ density file and which reported physical sizes count (`sway/glassine-output-dens
 
 `ui-scale-test.sh [SWAY [BASE]]` runs too (Docker, as `ink-popup-test.sh`): fractional output
 scales. It runs this sway headless with an output of 1404x1872 at the scales 1.6, 1.8, 2.4,
-0.8 and 2 and `ui-scale-client.c` as a whole-scale-only client and as a fractional one, whose
+0.8 and 2 (and with the output elsewhere in the layout, turned by 90, 180 and 270 degrees,
+and at 2.6, where the nearest whole number is 3) and `ui-scale-client.c` as a whole-scale-only client and as a fractional one, whose
 buffers have a value of their own in every pixel, and compares screenshots (wlr-screencopy)
 with them byte for byte: the scale the client is told (the nearest whole number; the
 fractional scale), a tiled window's and a floating window's configure size and pixels, a

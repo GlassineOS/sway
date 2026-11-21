@@ -191,8 +191,16 @@ pointer() {
     done
 }
 
-OW=1404
-OH=1872
+# the output's mode, and its pixels as it is turned
+MW=1404
+MH=1872
+OW=$MW
+OH=$MH
+# where the output is in the layout, its transform, and their name in a case
+POS="0 0"
+TURN=0
+WHERE=
+TAG=
 # shot N: with a second sway to compare with, keep a screenshot of the output
 shot() {
     [ -z "$KEEP" ] || send "dump HEADLESS-1 /out/$KEEP-$1.xrgb"
@@ -202,17 +210,18 @@ scale_case() {
     S=$1
     M=$2
     KEEP=${3:-}
-    T="$S $M:"
+    T="$S $M$WHERE:"
     N=$(calc "r($S) < 1 ? 1 : r($S)")
     K=$(calc "r($S * 120)")
-    start "${KEEP:-s$S-$M}" "output HEADLESS-1 mode ${OW}x${OH} scale $S"
+    start "${KEEP:-s$S-$M$TAG}" "output HEADLESS-1 mode ${MW}x${MH} scale $S pos $POS transform $TURN"
+    send "turn $TURN"
     # the output's layout size, as sway cuts it to whole layout px
     send "layout HEADLESS-1"
-    LW=$(new | sed -n 's/^layout HEADLESS-1 0 0 \([0-9]*\)x.*/\1/p')
-    LH=$(new | sed -n 's/^layout HEADLESS-1 0 0 [0-9]*x\([0-9]*\)$/\1/p')
+    LW=$(new | sed -n "s/^layout HEADLESS-1 $POS \\([0-9]*\\)x.*/\\1/p")
+    LH=$(new | sed -n "s/^layout HEADLESS-1 $POS [0-9]*x\\([0-9]*\\)\$/\\1/p")
     [ "$(calc "($LW <= $OW / $S && $LW > $OW / $S - 1.001 && $LH <= $OH / $S && $LH > $OH / $S - 1.001)")" = 1 ] ||
         bad "$T the output's layout size ${LW}x$LH"
-    expect "$T 1 wl_output.scale is $N" "^output HEADLESS-1 ${OW}x${OH} scale $N\$"
+    expect "$T 1 wl_output.scale is $N" "^output HEADLESS-1 ${MW}x${MH} scale $N\$"
     send "win $M 200 200"
     # 2: tiled over the whole output; its box in output pixels
     DW=$(calc "dev(0, $LW, $S)")
@@ -324,6 +333,21 @@ for S in 1.6 1.8 2.4 0.8 2; do
     done
 done
 
+# the same with the output elsewhere in the layout, turned, both, and at a
+# scale whose nearest whole number is 3
+for M in whole frac; do
+    POS="503 211" WHERE=" at 503,211" TAG=-pos
+    scale_case 1.6 $M
+    POS="0 0" TURN=90 OW=$MH OH=$MW WHERE=" turned 90" TAG=-90
+    scale_case 1.6 $M
+    POS="301 77" TURN=270 WHERE=" turned 270 at 301,77" TAG=-270
+    scale_case 1.8 $M
+    TURN=180 OW=$MW OH=$MH WHERE=" turned 180" TAG=-180
+    scale_case 2.4 $M
+    POS="0 0" TURN=0 WHERE= TAG=
+    scale_case 2.6 $M
+done
+
 # scale 2 on this sway and on the one to compare with
 if [ -e /base-bin ]; then
     NEW=$SWAY
@@ -346,7 +370,7 @@ if [ -e /base-bin ]; then
 fi
 
 # 7: a window of one size only
-start fixed "output HEADLESS-1 mode ${OW}x${OH} scale 1.6"
+start fixed "output HEADLESS-1 mode ${MW}x${MH} scale 1.6"
 send "fixed 301 201"
 send "win whole 0 0"
 send "ipcw move position 9 5"

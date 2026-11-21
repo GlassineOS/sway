@@ -43,8 +43,7 @@ client draws is resampled for it:
   rectangle, ink areas, writing regions and pen strokes. A client that wants a size in
   layout px (design px) draws F/N of its units per layout px; it sees only N, so F has to
   reach it another way (the session's published scale).
-- At a whole F, and wherever N equals F, a window takes sway's own path: nothing differs
-  from a whole scale before.
+- At a whole F a window takes sway's own path, as in upstream sway.
 
 The pen interface's points per mm stay the output's density over its scale; while the pen
 writes on a pixel view they are the density over N, as the strokes are in units.
@@ -54,7 +53,9 @@ clients are told N too but are still scaled by the renderer (from N to F); Xwayl
 are scaled as before (Xwayland is told the nearest whole scale); a window that lies on two
 outputs of different scales is pixel for pixel only on the one its workspace is on; an ink
 area's edge on a pixel view can be a layout px off; `glassine_ink` command boxes on a pixel
-view are in its units. An output's layout size is its pixels over F cut to whole layout px,
+view are in its units, as is the `geometry` of a pixel view in `get_tree`. `wl_output.scale`
+is the nearest whole number for every client, so a client with fractional scale that sizes
+something by it (a cursor) gets the smaller one below N.5. An output's layout size is its pixels over F cut to whole layout px,
 so up to a layout px at its right and bottom edge shows nothing (as in upstream sway).
 
 `get_outputs` carries `glassine_physical_width` and `glassine_physical_height`: the size in
