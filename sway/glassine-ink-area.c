@@ -80,6 +80,8 @@
 #include "sway/tree/view.h"
 #include "glassine-handwriting.h"
 #include "glassine-ink-area.h"
+#include "glassine-view-px.h"
+#include <wlr/util/region.h>
 #include "glassine-ink-v1-protocol.h"
 #include "epd-brush.h"
 #ifndef M_PI                    /* -std=c11 */
@@ -98,7 +100,17 @@
 /* v: the window it belongs to; own: else the input-method popup or layer
  * surface it belongs to (its root surface), NULL for anything else (menus,
  * drag icons...: those only cover) */
-struct item { struct wlr_box b; int ox, oy; struct sway_view *v; struct wlr_surface *s, *own; };
+struct item { struct wlr_box b; int ox, oy; struct sway_view *v; struct wlr_surface *s, *own; double units; };
+
+/* A pixel view's surfaces (glassine-view-px.h) count in units, `units` of them per
+ * layout px: their areas, regions and brush widths are taken to layout px here
+ * (areas rounded outwards, so an edge can be a layout px off). */
+static void to_layout(pixman_region32_t *r, double units)
+{
+	if (units != 1) {
+		wlr_region_scale(r, r, 1 / units);
+	}
+}
 
 /* ---- glassine_ink_brush_v1 (v3): a declarative brush ----
  * Refcounted: its resource holds one ref, every surface tool selecting it
@@ -812,7 +824,10 @@ static void collect(struct wlr_scene_buffer *sb, int lx, int ly, void *data)
 		return;
 	}
 	int bw, bh;
-	if (sb->dst_width > 0 && sb->dst_height > 0) {
+	double units = glassine_px_node_units(&sb->node);
+	if (units != 1) {
+		wlr_scene_node_get_layout_size(&sb->node, &bw, &bh);
+	} else if (sb->dst_width > 0 && sb->dst_height > 0) {
 		bw = sb->dst_width, bh = sb->dst_height;
 	} else {
 		bw = sb->buffer_width, bh = sb->buffer_height;
@@ -822,10 +837,10 @@ static void collect(struct wlr_scene_buffer *sb, int lx, int ly, void *data)
 		return;
 	}
 	struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(sb);
-	int ox = ss ? lx - ss->clip.x : lx, oy = ss ? ly - ss->clip.y : ly;
+	int ox = ss ? lx - (int)floor(ss->clip.x / units) : lx, oy = ss ? ly - (int)floor(ss->clip.y / units) : ly;
 	struct sway_view *v = view_of(&sb->node);
 	struct wlr_surface *s = ss ? ss->surface : NULL;
-	w->it[w->n++] = (struct item){ { lx, ly, bw, bh }, ox, oy, v, s, v ? NULL : owner_of(s) };
+	w->it[w->n++] = (struct item){ { lx, ly, bw, bh }, ox, oy, v, s, v ? NULL : owner_of(s), units };
 }
 
 static void app_name(struct sway_view *v, char *c, size_t len)
@@ -929,6 +944,7 @@ void glassine_ink_update(struct sway_output *output)
 	struct ink_surf *bs[MAXV];      /* the window's brush (an ink_surf with set_brush) */
 	pixman_region32_t vis[MAXV], sdk[MAXV], hwa[MAXV], occl;
 	bool has_sdk[MAXV], has_hw[MAXV];
+	double bu[MAXV];                /* the brush's surface: its units per layout px */
 	int nv = 0;
 	pixman_region32_init_rect(&occl, 0, 0, 0, 0);
 	for (int i = w.n - 1; i >= 0; i--) {                /* top to bottom */
@@ -947,6 +963,7 @@ void glassine_ink_update(struct sway_output *output)
 				has_sdk[nv] = false;
 				has_hw[nv] = false;
 				bs[nv] = NULL;
+				bu[nv] = 1;
 				pixman_region32_init(&sdk[nv]);
 				pixman_region32_init(&hwa[nv]);
 				pixman_region32_init(&vis[nv++]);
@@ -960,6 +977,7 @@ void glassine_ink_update(struct sway_output *output)
 				struct ink_surf *is = w.it[i].s ? ink_surf_for(w.it[i].s) : NULL;
 				if (is && (is->br[0].kind || is->br[1].kind) && !bs[k]) {
 					bs[k] = is;
+					bu[k] = w.it[i].units;
 				}
 				/* the app's areas, from its surface's origin (a view-less
 				 * owner's only from its client, never from the command) */
@@ -967,6 +985,7 @@ void glassine_ink_update(struct sway_output *output)
 					pixman_region32_t a;
 					pixman_region32_init(&a);
 					pixman_region32_copy(&a, &is->areas);
+					to_layout(&a, w.it[i].units);
 					pixman_region32_translate(&a, w.it[i].ox, w.it[i].oy);
 					pixman_region32_union(&sdk[k], &sdk[k], &a);
 					pixman_region32_fini(&a);
@@ -976,6 +995,7 @@ void glassine_ink_update(struct sway_output *output)
 				pixman_region32_t a;
 				pixman_region32_init(&a);
 				if (w.it[i].s && hw_areas(w.it[i].s, &a)) {
+					to_layout(&a, w.it[i].units);
 					pixman_region32_translate(&a, w.it[i].ox, w.it[i].oy);
 					pixman_region32_union(&hwa[k], &hwa[k], &a);
 					has_hw[k] = true;
@@ -1005,8 +1025,8 @@ void glassine_ink_update(struct sway_output *output)
 				kind[t] = o ? (o->d.kind == NB_ERASE ? 3 : o->d.kind == NB_NONE ? 1 : 2) : bs[k]->br[t].kind;
 			}
 			n += snprintf(msg + n, sizeof msg - n, "ink brush %d %u %.2f %.2f %.3f %u %.2f %.2f %.3f%s%s%s%s\n", nb,
-				kind[0], bs[k]->br[0].wmin * sc, bs[k]->br[0].wmax * sc, bs[k]->br[0].exp,
-				kind[1], bs[k]->br[1].wmin * sc, bs[k]->br[1].wmax * sc, bs[k]->br[1].exp,
+				kind[0], bs[k]->br[0].wmin * sc / bu[k], bs[k]->br[0].wmax * sc / bu[k], bs[k]->br[0].exp,
+				kind[1], bs[k]->br[1].wmin * sc / bu[k], bs[k]->br[1].wmax * sc / bu[k], bs[k]->br[1].exp,
 				id[0] ? " tip=" : "", id[0] ? id[0] : "", id[1] ? " rub=" : "", id[1] ? id[1] : "");
 		}
 		if (has_hw[k] && !bk[k] && !hb && n < (int)sizeof msg - 400) {

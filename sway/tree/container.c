@@ -877,10 +877,12 @@ static void floating_natural_resize(struct sway_container *con) {
 		con->pending.height = fmax(min_height, fmin(con->pending.height, max_height));
 	} else {
 		struct sway_view *view = con->view;
+		// Glassine: a pixel view's natural size is in units
+		double units = view->px_n > 0 ? (double)view->px_scale / view->px_n : 1;
 		con->pending.content_width =
-			fmax(min_width, fmin(view->natural_width, max_width));
+			fmax(min_width, fmin(round(view->natural_width / units), max_width));
 		con->pending.content_height =
-			fmax(min_height, fmin(view->natural_height, max_height));
+			fmax(min_height, fmin(round(view->natural_height / units), max_height));
 		container_set_geometry_from_content(con);
 	}
 }

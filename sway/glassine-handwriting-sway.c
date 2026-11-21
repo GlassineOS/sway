@@ -5,9 +5,14 @@
  * also when sway sends the app emulated pointer events instead of tablet ones. The eraser
  * end writes nothing here.
  *
- * The ink's units: the logical px per mm of the output the pen writes on, from its physical
- * size, else from the person's density for that output (glassine-output-density.h, kept by
- * Settings), else none: the units stay the pen's own (spec 004 FR-017).
+ * The ink's units: the logical px per mm of the output the pen writes on (its density over
+ * its scale, whatever the scale), from its physical size when that is plausible
+ * (glassine_od_size_plausible), else from the person's density for that output
+ * (glassine-output-density.h, kept by Settings), else none: the units stay the pen's own
+ * (spec 004 FR-017). A stroke is in its surface's coordinates. The surface of a pixel view
+ * (glassine-view-px.h: a whole-scale-only client on an output of fractional scale) counts in
+ * units of N output pixels, not in logical px, so while the pen writes on one the units are
+ * the density over N: a millimetre stays a millimetre.
  *
  * GLASSINE_HANDWRITING_SERVICE names the service's program (default
  * glassine-handwriting-service on PATH); empty: no service, raw strokes only. */
@@ -31,6 +36,7 @@
 #include "glassine-handwriting-sway.h"
 #include "glassine-ink-area.h"
 #include "glassine-output-density.h"
+#include "glassine-view-px.h"
 
 static void identify(struct wl_client *client, char *buf, size_t size)
 {
@@ -103,18 +109,21 @@ static double setting(struct wlr_output *o)
 	return density;
 }
 
+/* units per layout px of the surface the stroke is on (1 unless a pixel view's) */
+static double pen_units = 1;
+
 static void per_mm(struct sway_cursor *cursor)
 {
 	/* the mode's px over the panel's mm, both as the mode is (unturned), in logical px */
 	struct wlr_output *o = wlr_output_layout_output_at(root->output_layout, cursor->cursor->x, cursor->cursor->y);
 	if (!o || o->width <= 0) return;
 	double scale = o->scale > 0 ? o->scale : 1;
-	if (o->phys_width > 0) {
-		glassine_hw_set_per_mm(o->width / scale / o->phys_width);
+	if (glassine_od_size_plausible(o->width, o->height, o->phys_width, o->phys_height)) {
+		glassine_hw_set_per_mm(o->width / scale / o->phys_width * pen_units);
 		return;
 	}
 	double d = setting(o);
-	glassine_hw_set_per_mm(d > 0 ? d / scale : 0);
+	glassine_hw_set_per_mm(d > 0 ? d / scale * pen_units : 0);
 }
 
 void glassine_hw_sway_tip(struct sway_cursor *cursor, struct sway_tablet_tool *tool, struct wlr_surface *surface,
@@ -125,15 +134,17 @@ void glassine_hw_sway_tip(struct sway_cursor *cursor, struct sway_tablet_tool *t
 		return;
 	}
 	if (tool->tablet_v2_tool->wlr_tool->type == WLR_TABLET_TOOL_TYPE_ERASER) return;
+	pen_units = glassine_px_surface_units(surface);
 	per_mm(cursor);
 	glassine_hw_axis(NAN, tool->tilt_x, tool->tilt_y);
-	glassine_hw_pen_down(surface ? surface->resource : NULL, sx, sy, cursor->cursor->x, cursor->cursor->y, time);
+	glassine_hw_pen_down(surface ? surface->resource : NULL, sx, sy, cursor->cursor->x * pen_units,
+			     cursor->cursor->y * pen_units, time);
 }
 
 void glassine_hw_sway_axis(struct sway_cursor *cursor, struct sway_tablet_tool *tool, double pressure, uint32_t time)
 {
 	glassine_hw_axis(pressure, tool->tilt_x, tool->tilt_y);
-	if (glassine_hw_pen_active()) glassine_hw_pen_motion(cursor->cursor->x, cursor->cursor->y, time);
+	if (glassine_hw_pen_active()) glassine_hw_pen_motion(cursor->cursor->x * pen_units, cursor->cursor->y * pen_units, time);
 }
 
 void glassine_hw_sway_out(uint32_t time)

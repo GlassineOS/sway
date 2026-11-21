@@ -18,6 +18,8 @@
 #include "sway/tree/workspace.h"
 #include "sway/xdg_decoration.h"
 #include "../glassine-popup-hint.h"
+#include "../glassine-view-px.h"
+#include "sway/tree/root.h"
 
 static struct sway_xdg_popup *popup_create(
 	struct wlr_xdg_popup *wlr_popup, struct sway_view *view,
@@ -61,6 +63,18 @@ static void popup_unconstrain(struct sway_xdg_popup *popup) {
 		.width = output->width,
 		.height = output->height,
 	};
+	if (view->px_n > 0) {
+		/* Glassine: the toplevel's coordinates are units; the box rounded inwards */
+		double units = glassine_px_units(view);
+		double x1 = (output->lx - view->container->pending.content_x) * units;
+		double y1 = (output->ly - view->container->pending.content_y) * units;
+		output_toplevel_sx_box = (struct wlr_box){
+			.x = (int)ceil(x1) + view->geometry.x,
+			.y = (int)ceil(y1) + view->geometry.y,
+			.width = (int)floor(x1 + output->width * units) - (int)ceil(x1),
+			.height = (int)floor(y1 + output->height * units) - (int)ceil(y1),
+		};
+	}
 
 	wlr_xdg_popup_unconstrain_from_box(wlr_popup, &output_toplevel_sx_box);
 }
@@ -105,6 +119,10 @@ static struct sway_xdg_popup *popup_create(struct wlr_xdg_popup *wlr_popup,
 
 	popup->desc.relative = &view->content_tree->node;
 	popup->desc.view = view;
+	if (parent == root->layers.popup) {
+		/* Glassine: the popups of a pixel view count in its units */
+		glassine_px_popup_tree(view, popup->scene_tree);
+	}
 
 	if (!scene_descriptor_assign(&popup->scene_tree->node,
 			SWAY_SCENE_DESC_POPUP, &popup->desc)) {
@@ -175,6 +193,13 @@ static uint32_t configure(struct sway_view *view, double lx, double ly,
 	if (xdg_shell_view == NULL) {
 		return 0;
 	}
+	if (view->px_n > 0) {
+		/* Glassine: a pixel view's size in units */
+		glassine_px_box(view, lx, ly, width, height, &width, &height, NULL, NULL);
+	}
+	view->px_reconfigure = false;
+	view->px_conf_width = width;
+	view->px_conf_height = height;
 	return wlr_xdg_toplevel_set_size(view->wlr_xdg_toplevel,
 		width, height);
 }
@@ -321,6 +346,8 @@ static void handle_commit(struct wl_listener *listener, void *data) {
 			if (view->container->current.width) {
 				wlr_xdg_toplevel_set_size(view->wlr_xdg_toplevel, view->geometry.width,
 					view->geometry.height);
+				view->px_conf_width = view->geometry.width;
+				view->px_conf_height = view->geometry.height;
 			}
 			transaction_commit_dirty_client();
 		}

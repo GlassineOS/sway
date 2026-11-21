@@ -31,6 +31,7 @@
 #include "sway/tree/arrange.h"
 #include "sway/tree/container.h"
 #include "sway/tree/view.h"
+#include "../glassine-view-px.h"
 #include "sway/tree/workspace.h"
 #include "sway/config.h"
 #include "sway/xdg_decoration.h"
@@ -171,6 +172,14 @@ void view_get_constraints(struct sway_view *view, double *min_width,
 	if (view->impl->get_constraints) {
 		view->impl->get_constraints(view,
 				min_width, max_width, min_height, max_height);
+		if (view->px_n > 0) {
+			/* Glassine: the client's hints are in units */
+			double units = glassine_px_units(view);
+			if (*min_width != DBL_MIN) *min_width = ceil(*min_width / units);
+			if (*min_height != DBL_MIN) *min_height = ceil(*min_height / units);
+			if (*max_width != DBL_MAX) *max_width = fmax(*min_width, floor(*max_width / units));
+			if (*max_height != DBL_MAX) *max_height = fmax(*min_height, floor(*max_height / units));
+		}
 	} else {
 		*min_width = 1;
 		*max_width = DBL_MAX;
@@ -718,6 +727,11 @@ void view_map(struct sway_view *view, struct wlr_surface *wlr_surface,
 		return;
 	}
 	view->surface = wlr_surface;
+	view->px_n = 0;
+	view->px_scale = 0;
+	view->px_fractional = view->px_reconfigure = false;
+	view->px_conf_width = view->px_conf_height = 0;
+	wlr_scene_tree_set_pixel_units(view->content_tree, 0, 0);
 	view_populate_pid(view);
 	view->container = container_create(view);
 
@@ -745,7 +759,10 @@ void view_map(struct sway_view *view, struct wlr_surface *wlr_surface,
 		// scale to reduce startup jitter.
 		float scale = ws->output->wlr_output->scale;
 		wlr_fractional_scale_v1_notify_scale(wlr_surface, scale);
-		wlr_surface_set_preferred_buffer_scale(wlr_surface, ceil(scale));
+		wlr_surface_set_preferred_buffer_scale(wlr_surface,
+			wlr_fractional_scale_v1_whole_scale(wlr_surface, scale));
+		/* Glassine: a whole-scale-only client's view is shown pixel for pixel */
+		glassine_px_update(view, ws->output);
 	}
 
 	struct sway_seat *seat = input_manager_current_seat();
@@ -928,6 +945,18 @@ void view_update_size(struct sway_view *view) {
 	struct sway_container *con = view->container;
 	con->pending.content_width = view->geometry.width;
 	con->pending.content_height = view->geometry.height;
+	if (view->px_n > 0) {
+		/* Glassine: the geometry is in units; a box that is configured as this
+		 * size already stays */
+		double width, height;
+		int uw, uh;
+		glassine_px_layout_size(view, con->pending.content_x, con->pending.content_y,
+			view->geometry.width, view->geometry.height, &width, &height);
+		glassine_px_box(view, con->pending.content_x, con->pending.content_y,
+			con->current.content_width, con->current.content_height, &uw, &uh, NULL, NULL);
+		con->pending.content_width = uw == view->geometry.width ? con->current.content_width : width;
+		con->pending.content_height = uh == view->geometry.height ? con->current.content_height : height;
+	}
 	container_set_geometry_from_content(con);
 }
 
@@ -935,15 +964,27 @@ void view_center_and_clip_surface(struct sway_view *view) {
 	struct sway_container *con = view->container;
 
 	bool clip_to_geometry = true;
+	/* Glassine: a pixel view's geometry is in units; its box in units and in
+	 * output pixels */
+	double units = glassine_px_units(view);
+	int clip_width = con->current.content_width, clip_height = con->current.content_height;
+	int px_width = 0, px_height = 0;
+	if (view->px_n > 0) {
+		glassine_px_box(view, con->current.content_x, con->current.content_y,
+			con->current.content_width, con->current.content_height,
+			&clip_width, &clip_height, &px_width, &px_height);
+	}
 
 	if (container_is_floating(con)) {
 		// We always center the current coordinates rather than the next, as the
 		// geometry immediately affects the currently active rendering.
-		int x = (int) fmax(0, (con->current.content_width - view->geometry.width) / 2);
-		int y = (int) fmax(0, (con->current.content_height - view->geometry.height) / 2);
+		int x = (int) fmax(0, (con->current.content_width - view->geometry.width / units) / 2);
+		int y = (int) fmax(0, (con->current.content_height - view->geometry.height / units) / 2);
 		clip_to_geometry = !view->using_csd;
 
 		wlr_scene_node_set_position(&view->content_tree->node, x, y);
+		px_width -= (int)ceil(x * view->px_scale);
+		px_height -= (int)ceil(y * view->px_scale);
 	} else {
 		wlr_scene_node_set_position(&view->content_tree->node, 0, 0);
 	}
@@ -955,11 +996,17 @@ void view_center_and_clip_surface(struct sway_view *view) {
 			clip = (struct wlr_box){
 				.x = con->view->geometry.x,
 				.y = con->view->geometry.y,
-				.width = con->current.content_width,
-				.height = con->current.content_height,
+				.width = clip_width,
+				.height = clip_height,
 			};
 		}
 		wlr_scene_subsurface_tree_set_clip(&con->view->content_tree->node, &clip);
+	}
+	if (view->px_n > 0) {
+		if (!clip_to_geometry) {
+			px_width = px_height = 0;
+		}
+		wlr_scene_tree_set_pixel_clip(view->content_tree, px_width, px_height);
 	}
 }
 
@@ -1142,7 +1189,15 @@ void view_remove_saved_buffer(struct sway_view *view) {
 
 static void view_save_buffer_iterator(struct wlr_scene_buffer *buffer,
 		int sx, int sy, void *data) {
-	struct wlr_scene_tree *tree = data;
+	struct sway_view *view = data;
+	struct wlr_scene_tree *tree = view->saved_surface_tree;
+	// Glassine: the saved tree lies where the content tree does; a pixel
+	// view's buffers keep their place in its units
+	sx -= view->content_tree->node.x;
+	sy -= view->content_tree->node.y;
+	if (view->px_n > 0) {
+		wlr_scene_node_pixel_tree(&buffer->node, &sx, &sy);
+	}
 
 	struct wlr_scene_buffer *sbuf = wlr_scene_buffer_create(tree, NULL);
 	if (!sbuf) {
@@ -1174,8 +1229,15 @@ void view_save_buffer(struct sway_view *view) {
 	// the tree. This will prevent over damaging or other weirdness.
 	wlr_scene_node_set_enabled(&view->saved_surface_tree->node, false);
 
+	// Glassine: a copy of the content tree, with its position and its pixel units
+	wlr_scene_node_set_position(&view->saved_surface_tree->node,
+		view->content_tree->node.x, view->content_tree->node.y);
+	wlr_scene_tree_set_pixel_units(view->saved_surface_tree, view->px_n, view->px_scale);
+	wlr_scene_tree_set_pixel_clip(view->saved_surface_tree,
+		view->content_tree->px_clip_width, view->content_tree->px_clip_height);
+
 	wlr_scene_node_for_each_buffer(&view->content_tree->node,
-		view_save_buffer_iterator, view->saved_surface_tree);
+		view_save_buffer_iterator, view);
 
 	wlr_scene_node_set_enabled(&view->content_tree->node, false);
 	wlr_scene_node_set_enabled(&view->saved_surface_tree->node, true);

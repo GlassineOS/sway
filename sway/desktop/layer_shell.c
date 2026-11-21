@@ -484,7 +484,8 @@ void handle_layer_shell_surface(struct wl_listener *listener, void *data) {
 	wlr_fractional_scale_v1_notify_scale(surface->layer_surface->surface,
 		layer_surface->output->scale);
 	wlr_surface_set_preferred_buffer_scale(surface->layer_surface->surface,
-		ceil(layer_surface->output->scale));
+		wlr_fractional_scale_v1_whole_scale(surface->layer_surface->surface,
+			layer_surface->output->scale));
 
 	surface->surface_commit.notify = handle_surface_commit;
 	wl_signal_add(&layer_surface->surface->events.commit,

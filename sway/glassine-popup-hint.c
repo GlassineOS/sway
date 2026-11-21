@@ -1,3 +1,4 @@
+#include <math.h>
 /* glassine-popup-hint.c — app menus (xdg_popup) as popups for glassine-epdd-desktop. Built into
  * the patched sway (0003): on X, glassine-epdd-desktop sees a menu window map and unmap and
  * paints it as a popup (DU at once, GC16 when it closes); sway IPC doesn't
@@ -14,6 +15,7 @@
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include "glassine-view-px.h"
 #include "sway/server.h"
 #include "sway/tree/root.h"
 #include "glassine-popup-hint.h"
@@ -58,6 +60,13 @@ static void show(void *data) {
 	wlr_xdg_surface_get_geometry(p->popup->base, &geo);
 	/* the whole surface: shadows around the menu change too */
 	double x = lx - geo.x, y = ly - geo.y, w = s->current.width, h = s->current.height;
+	double units = glassine_px_node_units(&p->tree->node);
+	if (units != 1) {       /* a pixel view's popup: its sizes are units; the layout box around it */
+		x = lx - ceil(geo.x / units) - 1;
+		y = ly - ceil(geo.y / units) - 1;
+		w = ceil(w / units) + 2;
+		h = ceil(h / units) + 2;
+	}
 	struct wlr_output *o = wlr_output_layout_output_at(root->output_layout, x + w / 2, y + h / 2);
 	if (!o) {
 		return;

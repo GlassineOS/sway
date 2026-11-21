@@ -297,6 +297,12 @@ static json_object *ipc_json_create_node(int id, const char* type, char *name,
 
 static void ipc_json_describe_wlr_output(struct wlr_output *wlr_output, json_object *object) {
 	json_object_object_add(object, "primary", json_object_new_boolean(false));
+	// Glassine: the physical size the output reports, in mm (0: none), as it
+	// reports it: whether it counts is the reader's to judge
+	json_object_object_add(object, "glassine_physical_width",
+			json_object_new_int(wlr_output->phys_width));
+	json_object_object_add(object, "glassine_physical_height",
+			json_object_new_int(wlr_output->phys_height));
 	json_object_object_add(object, "make",
 			json_object_new_string(wlr_output->make ? wlr_output->make : "Unknown"));
 	json_object_object_add(object, "model",
